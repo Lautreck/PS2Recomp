@@ -152,6 +152,9 @@ namespace ps2recomp
                         ss << "label_" << std::hex << delaySlot->address << std::dec << ":\n";
                     }
 
+                    if (hasDecodedDelaySlot && !delaySlot->switchName.empty())
+                        throw std::runtime_error("switch patch in a branch delay slot is not supported");
+
                     if (gifDmaKickPlan.valid &&
                         gifDmaKickPlan.completesInDelaySlot &&
                         gifDmaKickPlan.branchIndex == i &&
@@ -202,6 +205,31 @@ namespace ps2recomp
 
                     ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
                        << std::dec;
+                    if (!inst.switchName.empty())
+                    {
+                        // Switchable patch: both words are translated, PS2_SWITCH(name) picks one at run time.
+                        const Instruction patched = R5900Decoder().decodeInstruction(inst.address, inst.switchRaw);
+                        if (patched.isBranch || patched.isJump || patched.hasDelaySlot)
+                            throw std::runtime_error("switch patch must not be a branch or jump");
+                        ss << "    if (PS2_SWITCH(\"" << inst.switchName << "\")) { // 0x" << std::hex << inst.switchRaw
+                           << std::dec << "  " << R5900Decoder::disassembleInstruction(patched) << "\n";
+                        ss << "    " << cg.translateInstruction(patched, resolveMemoryAccessHint(patched, constantRegisters))
+                           << "\n    } else {\n";
+                        ss << "    " << cg.translateInstruction(inst, resolveMemoryAccessHint(inst, constantRegisters))
+                           << "\n    }\n";
+                        // A register stays known only when both words leave it with the same value.
+                        ConstantRegisterState whenOn = constantRegisters, whenOff = constantRegisters;
+                        updateConstantRegisters(patched, whenOn);
+                        updateConstantRegisters(inst, whenOff);
+                        for (uint32_t reg = 0; reg < 32u; ++reg)
+                        {
+                            uint32_t on = 0u, off = 0u;
+                            if (!whenOn.read(reg, on) || !whenOff.read(reg, off) || on != off)
+                                whenOff.invalidate(reg);
+                        }
+                        constantRegisters = whenOff;
+                        continue;
+                    }
                     const MemoryAccessHint memoryHint = resolveMemoryAccessHint(inst, constantRegisters);
                     ss << "    " << cg.translateInstruction(inst, memoryHint);
                     if (inst.isMmio)

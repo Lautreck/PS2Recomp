@@ -3,6 +3,8 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -228,7 +230,86 @@ namespace
         return nreg == 0u ? 16u : nreg;
     }
 
-}
+} // namespace
+
+// TEKKEN4_GT_STATS=1. IRQ bits are the mask advanceEeTimers returns (TIM0..TIM3).
+namespace
+{
+    struct GameThreadStats
+    {
+        bool on = false;
+        uint64_t timerCalls = 0;
+        uint64_t timerCycles = 0;
+        uint64_t timerIrqReturns = 0;
+        uint64_t timerIrqBits = 0;
+        uint64_t timerLate = 0;
+        uint64_t timerFlush = 0;
+        uint64_t sprCalls = 0;
+        uint64_t sprQwords = 0;
+        uint64_t mfifoDrains = 0;
+        uint64_t mfifoBytes = 0;
+
+        GameThreadStats()
+        {
+            const char *env = std::getenv("TEKKEN4_GT_STATS");
+            on = env != nullptr && env[0] != '\0' && env[0] != '0';
+        }
+
+        static uint32_t popcount4(uint32_t mask)
+        {
+            uint32_t n = 0;
+            for (uint32_t bit = 1u; bit <= 8u; bit <<= 1u)
+            {
+                if ((mask & bit) != 0u)
+                    ++n;
+            }
+            return n;
+        }
+
+        void noteTimer(uint64_t cycles, uint32_t irqMask)
+        {
+            if (!on)
+                return;
+            ++timerCalls;
+            timerCycles += cycles;
+            if (irqMask != 0u)
+            {
+                ++timerIrqReturns;
+                timerIrqBits += popcount4(irqMask);
+            }
+            if ((timerCalls & 0x3FFFFFu) == 0u)
+                dump("snap");
+        }
+
+        void noteFlush(uint32_t irqMask)
+        {
+            if (!on)
+                return;
+            ++timerFlush;
+            if (irqMask != 0u)
+                ++timerLate;
+        }
+
+        void dump(const char *tag) const
+        {
+            if (!on)
+                return;
+            std::fprintf(stderr,
+                         "[gt-stats] mem %s timer_calls=%llu timer_cycles=%llu timer_irq_returns=%llu timer_irq_bits=%llu "
+                         "spr_calls=%llu spr_qwords=%llu mfifo_drains=%llu mfifo_bytes=%llu "
+                         "timer_late=%llu timer_flush=%llu\n",
+                         tag, static_cast<unsigned long long>(timerCalls), static_cast<unsigned long long>(timerCycles),
+                         static_cast<unsigned long long>(timerIrqReturns), static_cast<unsigned long long>(timerIrqBits),
+                         static_cast<unsigned long long>(sprCalls), static_cast<unsigned long long>(sprQwords),
+                         static_cast<unsigned long long>(mfifoDrains), static_cast<unsigned long long>(mfifoBytes),
+                         static_cast<unsigned long long>(timerLate), static_cast<unsigned long long>(timerFlush));
+        }
+
+        ~GameThreadStats() { dump("final"); }
+    };
+
+    GameThreadStats g_gtStats;
+} // namespace
 
 // Helpers for GS VRAM addressing (PSMCT32 path).
 static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y, uint32_t fbw)
@@ -329,8 +410,9 @@ bool PS2Memory::initialize(size_t ramSize)
     m_codeRegions.clear();
     m_path3Masked = false;
     m_path3MaskedFifo.clear();
-    m_vif1PendingPath2ImageQwc = 0u;
-    m_vif1PendingPath2DirectHl = false;
+    m_path2CutRemainingBytes = 0u;
+    m_vif1Carry.clear();
+    m_mfifoWaitingChannel = 0u;
     resetEeTimers();
 
     try
@@ -402,21 +484,14 @@ bool PS2Memory::initialize(size_t ramSize)
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    m_eeTimerDebt = 0;
+    m_eeTimerLimit = 1;
+    m_latchedTimerIrq = 0;
+    m_gifFqcPending = false;
 }
 
-uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+uint32_t PS2Memory::applyEeTimerTicks(uint64_t eeCycles) noexcept
 {
-    if (eeCycles == 0u)
-    {
-        return 0u;
-    }
-
-    constexpr uint32_t kGifStat = 0x10003020u;
-    constexpr uint32_t kGifFqcMask = 0x1F000000u;
-    auto gifStatIt = m_ioRegisters.find(kGifStat);
-    if (gifStatIt != m_ioRegisters.end())
-        gifStatIt->second &= ~kGifFqcMask;
-
     uint32_t interruptMask = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
     {
@@ -477,6 +552,48 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
             interruptMask |= 1u << index;
         }
     }
+    return interruptMask;
+}
+
+void PS2Memory::flushEeTimerDebt() noexcept
+{
+    if (m_eeTimerDebt == 0u)
+        return;
+    const uint32_t mask = applyEeTimerTicks(m_eeTimerDebt);
+    m_eeTimerDebt = 0;
+    const uint64_t next = cyclesUntilNextEeTimerInterrupt();
+    m_eeTimerLimit = (next == std::numeric_limits<uint64_t>::max()) ? next : std::max<uint64_t>(1u, next);
+    g_gtStats.noteFlush(mask);
+    if (mask != 0u)
+        m_latchedTimerIrq |= mask;
+}
+
+uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+{
+    if (eeCycles == 0u)
+    {
+        g_gtStats.noteTimer(0u, 0u);
+        return 0u;
+    }
+
+    if (m_gifFqcPending)
+    {
+        constexpr uint32_t kGifStat = 0x10003020u;
+        constexpr uint32_t kGifFqcMask = 0x1F000000u;
+        auto gifStatIt = m_ioRegisters.find(kGifStat);
+        if (gifStatIt != m_ioRegisters.end())
+            gifStatIt->second &= ~kGifFqcMask;
+        m_gifFqcPending = false;
+    }
+
+    // Ticks are applied on every call: batching them up to the next compare/overflow broke the EE Timer2
+    // compare-IRQ tests (patch 15 review), so m_eeTimerDebt stays 0 and flushEeTimerDebt has nothing to do.
+    m_eeTimerDebt += eeCycles;
+    uint32_t interruptMask = m_latchedTimerIrq;
+    m_latchedTimerIrq = 0u;
+    interruptMask |= applyEeTimerTicks(m_eeTimerDebt);
+    m_eeTimerDebt = 0;
+    g_gtStats.noteTimer(eeCycles, interruptMask);
     return interruptMask;
 }
 
@@ -1128,6 +1245,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        flushEeTimerDebt();
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -1216,6 +1334,29 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         return true;
     }
 
+    if (address == 0x1000F590u)
+    {
+        // D_ENABLEW: D_ENABLER (0x1000F520) reads back the last write. Games poll it after setting CPND
+        // (bit 16) to suspend DMA; transfers here finish synchronously, so there is nothing to hold back.
+        m_ioRegisters[address] = value;
+        m_ioRegisters[0x1000F520u] = value;
+        return true;
+    }
+
+    // A DMA channel still running ignores CHCR writes, except one clearing STR, which stops it, unless the DMAC is
+    // suspended (D_ENABLER.CPND), as in PCSX2's DmaExec ("Fields other than STR can only be written to when the DMA is
+    // stopped"). Here the only channel left running is an MFIFO drain waiting for the ring to fill.
+    if (m_mfifoWaitingChannel != 0u && address == m_mfifoWaitingChannel && (m_ioRegisters[address] & 0x100u) != 0u &&
+        ((m_ioRegisters[0x1000F520u] >> 16) & 1u) == 0u)
+    {
+        if ((value & 0x100u) == 0u)
+        {
+            m_ioRegisters[address] &= ~0x100u;
+            m_mfifoWaitingChannel = 0u;
+        }
+        return true;
+    }
+
     m_ioRegisters[address] = value;
 
     if (address >= 0x10003C00u && address < 0x10003E00u)
@@ -1229,8 +1370,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             {
                 const bool wasPath3Masked = m_path3Masked;
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
-                m_vif1PendingPath2ImageQwc = 0u;
-                m_vif1PendingPath2DirectHl = false;
+                m_path2CutRemainingBytes = 0u;
                 m_path3Masked = false;
                 if (wasPath3Masked)
                     flushMaskedPath3Packets();
@@ -1308,6 +1448,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
+                return true;
+            }
+
+            if (channelBase == mfifoDrainChannel() && ((value >> 2) & 0x3u) == 1u)
+            {
+                // MFIFO drain: STR stays set, tags are consumed as fromSPR fills the ring.
+                drainMfifo();
                 return true;
             }
 
@@ -1403,6 +1550,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const bool transferTagData = isVifChannel && (chcr & 0x40u) != 0u;
 
                     int tagsProcessed = 0;
+                    bool chainEnded = false;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
 
                     while (tagsProcessed < kMaxChainTags)
@@ -1518,7 +1666,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
+                        {
+                            chainEnded = true;
                             break;
+                        }
                     }
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
@@ -1548,10 +1699,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             m_pendingVif0Transfers.push_back(std::move(pt));
                         }
                     }
-                    // else if (channelBase == 0x10009000u)
-                    // {
-
-                    // }
+                    else if (chainEnded)
+                    {
+                        // A chain that ends without carrying any data (a lone END, REFE or IRQ tag) still
+                        // completes: STR clears and the channel raises D_STAT and its DMAC interrupt.
+                        const uint32_t cause = channelBase == 0x1000A000u ? 2u : (channelBase == 0x10009000u ? 1u : 0u);
+                        m_ioRegisters[channelBase + 0x20] = 0u;
+                        completeDmacChannel(channelBase, cause);
+                    }
                 }
                 else if (qwc > 0)
                 {
@@ -1592,6 +1747,8 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
         return false;
 
     const uint32_t mode = (chcr >> 2u) & 0x3u;
+    if (mode == 1u && channelBase == kSprToChannel)
+        return processSprToChain(chcr);
     if (mode != 0u)
         return false;
 
@@ -1599,6 +1756,44 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
     const uint32_t byteCount = qwc * 16u;
     const uint32_t originalMadr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
     const uint32_t originalSadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
+
+    if (channelBase == kSprFromChannel && mfifoDrainChannel() != 0u)
+    {
+        // MFIFO: fromSPR's destination is the ring, MADR wraps inside it (RBOR + (addr & RBSR)).
+        uint32_t dst = mfifoWrap(originalMadr);
+        uint32_t scratchOffset = originalSadr;
+        if (g_gtStats.on)
+        {
+            ++g_gtStats.sprCalls;
+            g_gtStats.sprQwords += qwc;
+        }
+        uint32_t bytesLeft = byteCount;
+        while (bytesLeft != 0u)
+        {
+            const uint32_t phys = dst & (PS2_RAM_SIZE - 1u);
+            const uint32_t scratchQw = (PS2_SCRATCHPAD_SIZE - scratchOffset) >> 4u;
+            const uint32_t leftQw = bytesLeft >> 4u;
+            uint32_t n = mfifoContigQwords(dst);
+            if (scratchQw < n)
+                n = scratchQw;
+            if (leftQw < n)
+                n = leftQw;
+            if (n == 0u)
+                break;
+            const uint32_t nBytes = n * 16u;
+            std::memcpy(m_rdram + phys, m_scratchpad + scratchOffset, nBytes);
+            markModified(phys, nBytes);
+            scratchOffset = (scratchOffset + nBytes) & (PS2_SCRATCHPAD_SIZE - 1u);
+            dst = mfifoWrap(dst + nBytes);
+            bytesLeft -= nBytes;
+        }
+        m_ioRegisters[channelBase + 0x10u] = dst;
+        m_ioRegisters[channelBase + 0x20u] = 0u;
+        m_ioRegisters[channelBase + 0x80u] = scratchOffset & 0x3FF0u;
+        completeDmacChannel(channelBase, 8u);
+        drainMfifo();
+        return true;
+    }
 
     uint32_t mainOffset = 0u;
     try
@@ -1660,6 +1855,319 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
     queueCompletedDmacCause(cause);
 }
 
+bool PS2Memory::processSprToChain(uint32_t chcr)
+{
+    // toSPR (channel 9) in source-chain mode: DMAtags are read from main memory at TADR and their data is copied
+    // to scratchpad at SADR (wrapping inside the 16 KB). With CHCR.TTE the whole tag qword is copied first.
+    static constexpr uint32_t kChannel = 0x1000D400u;
+    const bool transferTag = (chcr & 0x40u) != 0u;
+    const bool tieEnabled = (chcr & 0x80u) != 0u;
+    uint32_t tadr = m_ioRegisters[kChannel + 0x30u] & 0x7FFFFFF0u;
+    uint32_t madr = m_ioRegisters[kChannel + 0x10u] & 0x7FFFFFF0u;
+    uint32_t sadr = m_ioRegisters[kChannel + 0x80u] & 0x3FF0u;
+    uint32_t asr0 = m_ioRegisters[kChannel + 0x40u];
+    uint32_t asr1 = m_ioRegisters[kChannel + 0x50u];
+    uint32_t asp = (chcr >> 4u) & 0x3u;
+    uint32_t lastTagUpper = chcr >> 16u;
+
+    auto toScratchpad = [&](uint32_t from, uint32_t qwCount)
+    {
+        uint32_t src = 0u;
+        try
+        {
+            src = translateAddress(from);
+        }
+        catch (const std::exception &)
+        {
+            return;
+        }
+        for (uint32_t i = 0u; i < qwCount && src + 16u <= PS2_RAM_SIZE; ++i, src += 16u)
+        {
+            std::memcpy(m_scratchpad + sadr, m_rdram + src, 16u);
+            sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+        }
+    };
+
+    bool ended = false;
+    for (int tags = 0; tags < 4096 && !ended; ++tags)
+    {
+        uint32_t tagPhys = 0u;
+        try
+        {
+            tagPhys = translateAddress(tadr);
+        }
+        catch (const std::exception &)
+        {
+            break;
+        }
+        if (tagPhys + 16u > PS2_RAM_SIZE)
+            break;
+        const uint64_t tag = loadScalar<uint64_t>(m_rdram + tagPhys, 0, 16, "spr chain tag", tadr);
+        const uint32_t tagQwc = static_cast<uint32_t>(tag & 0xFFFFu);
+        const uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7u);
+        const bool irq = ((tag >> 31) & 0x1u) != 0u;
+        const uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFF0u);
+        lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
+
+        if (transferTag)
+        {
+            std::memcpy(m_scratchpad + sadr, m_rdram + tagPhys, 16u);
+            sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+        }
+
+        const uint32_t next = tadr + 16u;
+        switch (id)
+        {
+        case 0u: // REFE
+            madr = addr;
+            tadr = next;
+            ended = true;
+            break;
+        case 1u: // CNT
+            madr = next;
+            tadr = next + tagQwc * 16u;
+            break;
+        case 2u: // NEXT
+            madr = next;
+            tadr = addr;
+            break;
+        case 3u: // REF
+        case 4u: // REFS
+            madr = addr;
+            tadr = next;
+            break;
+        case 5u: // CALL
+            madr = next;
+            if (asp == 0u)
+                asr0 = next + tagQwc * 16u;
+            else
+                asr1 = next + tagQwc * 16u;
+            asp = std::min(asp + 1u, 2u);
+            tadr = addr;
+            break;
+        case 6u: // RET
+            madr = next;
+            if (asp == 0u)
+                ended = true;
+            else
+                tadr = (--asp == 1u) ? asr1 : asr0;
+            break;
+        case 7u: // END
+            madr = next;
+            ended = true;
+            break;
+        }
+        toScratchpad(madr, tagQwc);
+        madr += tagQwc * 16u;
+        if (irq && tieEnabled)
+            ended = true;
+    }
+
+    m_ioRegisters[kChannel + 0x30u] = tadr;
+    m_ioRegisters[kChannel + 0x10u] = madr;
+    m_ioRegisters[kChannel + 0x80u] = sadr;
+    m_ioRegisters[kChannel + 0x40u] = asr0;
+    m_ioRegisters[kChannel + 0x50u] = asr1;
+    m_ioRegisters[kChannel + 0x20u] = 0u;
+    m_ioRegisters[kChannel] = (chcr & 0x0000FFCFu) | ((asp & 0x3u) << 4u) | (lastTagUpper << 16u);
+    completeDmacChannel(kChannel, 9u);
+    return true;
+}
+
+uint32_t PS2Memory::mfifoDrainChannel()
+{
+    const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
+    const uint32_t mfd = dctrlIt == m_ioRegisters.end() ? 0u : (dctrlIt->second >> 2u) & 0x3u;
+    if (mfd == 2u)
+        return 0x10009000u; // VIF1
+    if (mfd == 3u)
+        return 0x1000A000u; // GIF
+    return 0u;
+}
+
+uint32_t PS2Memory::mfifoWrap(uint32_t address)
+{
+    const uint32_t rbor = m_ioRegisters[0x1000E050u] & 0x7FFFFFF0u;
+    const uint32_t rbsr = m_ioRegisters[0x1000E040u] & 0x7FFFFFF0u;
+    return rbor + (address & rbsr);
+}
+
+uint32_t PS2Memory::mfifoContigQwords(uint32_t addr)
+{
+    const uint32_t rbor = m_ioRegisters[0x1000E050u] & 0x7FFFFFF0u;
+    const uint32_t rbsr = m_ioRegisters[0x1000E040u] & 0x7FFFFFF0u;
+    // mfifoWrap is rbor + (addr & rbsr). That is a linear span only when rbor sits on a mask boundary.
+    if (rbsr == 0u || (rbor & rbsr) != 0u || addr < rbor)
+        return 1u;
+    const uint32_t off = addr - rbor;
+    if (off > rbsr)
+        return 1u;
+    uint32_t n = ((rbsr - off) >> 4u) + 1u;
+    const uint32_t phys = addr & (PS2_RAM_SIZE - 1u);
+    const uint32_t ramQw = (PS2_RAM_SIZE - phys) >> 4u;
+    if (ramQw < n)
+        n = ramQw;
+    return n == 0u ? 1u : n;
+}
+
+void PS2Memory::drainMfifo()
+{
+    const uint32_t channel = mfifoDrainChannel();
+    if (channel == 0u || m_mfifoDraining)
+        return;
+    const uint32_t chcr = m_ioRegisters[channel];
+    if ((chcr & 0x100u) == 0u || ((chcr >> 2u) & 0x3u) != 1u)
+        return;
+    m_mfifoDraining = true;
+
+    const uint32_t rbor = m_ioRegisters[0x1000E050u] & 0x7FFFFFF0u;
+    const uint32_t ringMask = (m_ioRegisters[0x1000E040u] & 0x7FFFFFF0u) | 0xFu;
+    const uint32_t writePos = m_ioRegisters[0x1000D010u]; // fromSPR MADR, already inside the ring
+    const bool isVif = channel == 0x10009000u;
+    const bool transferTag = isVif && (chcr & 0x40u) != 0u; // CHCR.TTE
+    const bool tieEnabled = (chcr & 0x80u) != 0u;
+    uint32_t tadr = mfifoWrap(m_ioRegisters[channel + 0x30u]);
+    uint32_t madr = m_ioRegisters[channel + 0x10u];
+    uint32_t lastTagUpper = chcr >> 16u;
+    bool ended = false;
+    // One buffer for the whole CNT/NEXT/END packet. DIRECT does not use m_vif1Carry, so this stays one
+    // processVIF1Data. clear() keeps the capacity from the previous drain.
+    m_mfifoPacket.clear();
+
+    auto appendSpan = [&](const uint8_t *src, uint32_t bytes)
+    {
+        if (src == nullptr || bytes == 0u)
+            return;
+        const size_t old = m_mfifoPacket.size();
+        m_mfifoPacket.resize(old + bytes);
+        std::memcpy(m_mfifoPacket.data() + old, src, bytes);
+    };
+    auto copyRing = [&](uint32_t from, uint32_t qwCount)
+    {
+        uint32_t left = qwCount;
+        while (left != 0u)
+        {
+            uint32_t n = mfifoContigQwords(from);
+            if (left < n)
+                n = left;
+            if (n == 0u)
+                break;
+            appendSpan(m_rdram + (from & (PS2_RAM_SIZE - 1u)), n * 16u);
+            from = mfifoWrap(from + n * 16u);
+            left -= n;
+        }
+        return from;
+    };
+    // REF/REFS/REFE data can live anywhere; only addresses inside the ring wrap.
+    auto copyAnywhere = [&](uint32_t from, uint32_t qwCount)
+    {
+        if ((from & ~ringMask) == rbor)
+            return copyRing(from, qwCount);
+        const bool scratch = isScratchpad(from);
+        uint32_t phys = 0u;
+        try
+        {
+            phys = translateAddress(from);
+        }
+        catch (const std::exception &)
+        {
+            return from;
+        }
+        const uint8_t *base = scratch ? m_scratchpad : m_rdram;
+        const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        const uint32_t bytes = qwCount * 16u;
+        if (phys < limit)
+            appendSpan(base + phys, std::min(bytes, limit - phys));
+        return from + bytes;
+    };
+
+    for (int tags = 0; tags < 0x10000 && !ended; ++tags)
+    {
+        const uint32_t available = ((writePos - tadr) & ringMask) / 16u;
+        if (available == 0u)
+            break; // ring empty: the channel stalls with STR set until fromSPR writes more
+
+        const uint8_t *tp = m_rdram + (tadr & (PS2_RAM_SIZE - 1u));
+        const uint64_t tag = loadScalar<uint64_t>(tp, 0, 16, "mfifo tag", tadr);
+        const uint32_t tagQwc = static_cast<uint32_t>(tag & 0xFFFFu);
+        const uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7u);
+        const bool irq = ((tag >> 31) & 0x1u) != 0u;
+        const uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFF0u);
+        const bool dataFollowsTag = id == 1u || id == 2u || id == 7u;
+        if (dataFollowsTag && available < 1u + tagQwc)
+            break; // packet only partly written: wait for the rest
+
+        lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
+        if (transferTag)
+            appendSpan(tp + 8u, 8u);
+
+        const uint32_t dataStart = mfifoWrap(tadr + 16u);
+        switch (id)
+        {
+        case 0u: // REFE
+            madr = copyAnywhere(addr, tagQwc);
+            tadr = dataStart;
+            ended = true;
+            break;
+        case 1u: // CNT
+            madr = copyRing(dataStart, tagQwc);
+            tadr = madr;
+            break;
+        case 2u: // NEXT
+            madr = copyRing(dataStart, tagQwc);
+            tadr = mfifoWrap(addr);
+            break;
+        case 3u: // REF
+        case 4u: // REFS
+            madr = copyAnywhere(addr, tagQwc);
+            tadr = dataStart;
+            break;
+        case 7u: // END: TADR stays on the tag
+            madr = copyRing(dataStart, tagQwc);
+            ended = true;
+            break;
+        default: // CALL/RET have no meaning in a ring
+            std::cerr << "[mfifo] unsupported tag id " << id << " at 0x" << std::hex << tadr << std::dec << std::endl;
+            ended = true;
+            break;
+        }
+        if (irq && tieEnabled)
+            ended = true;
+    }
+
+    m_ioRegisters[channel + 0x30u] = tadr;
+    m_ioRegisters[channel + 0x10u] = madr;
+    m_ioRegisters[channel] = (m_ioRegisters[channel] & 0x0000FFFFu) | (lastTagUpper << 16u);
+
+    if (!m_mfifoPacket.empty())
+    {
+        if (g_gtStats.on)
+        {
+            ++g_gtStats.mfifoDrains;
+            g_gtStats.mfifoBytes += m_mfifoPacket.size();
+        }
+        if (isVif)
+        {
+            processVIF1Data(m_mfifoPacket.data(), static_cast<uint32_t>(m_mfifoPacket.size()));
+        }
+        else
+        {
+            m_seenGifCopy = true;
+            m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+            submitGifPacket(GifPathId::Path3, m_mfifoPacket.data(), static_cast<uint32_t>(m_mfifoPacket.size()), false);
+        }
+        if (m_gifArbiter)
+            m_gifArbiter->drain();
+    }
+    if (ended)
+    {
+        m_ioRegisters[channel + 0x20u] = 0u;
+        completeDmacChannel(channel, isVif ? 1u : 2u);
+    }
+    m_mfifoWaitingChannel = ended ? 0u : channel;
+    m_mfifoDraining = false;
+}
+
 void PS2Memory::processPendingTransfers()
 {
     const bool hadGif = !m_pendingGifTransfers.empty();
@@ -1677,6 +2185,7 @@ void PS2Memory::processPendingTransfers()
         constexpr uint32_t kGifFqcMask = 0x1F000000u;
         uint32_t &gifStat = m_ioRegisters[kGifStat];
         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+        m_gifFqcPending = true;
     }
 
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
@@ -1959,7 +2468,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     }
 
     if (m_gifArbiter)
-        m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
+        m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl, drainImmediately);
     else if (m_gifPacketCallback)
         m_gifPacketCallback(data, sizeBytes);
 
@@ -2284,6 +2793,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        flushEeTimerDebt();
         const EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -2361,6 +2871,9 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         {
             if ((address & 0xFF) == 0x00)
             {
+                // An MFIFO drain channel stays busy until drainMfifo() reaches an END tag.
+                if ((address & 0xFFFFFF00u) == mfifoDrainChannel() && ((m_ioRegisters[address] >> 2u) & 0x3u) == 1u)
+                    return m_ioRegisters[address];
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
                 m_ioRegisters[address] = channelStatus;
                 return channelStatus;

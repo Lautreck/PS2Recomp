@@ -17,6 +17,8 @@ public:
 private:
     bool m_initialized = false;
     bool m_visible = true;
+    bool m_settingsVisible = false; // F2
+    bool m_debuggerOff = false;     // PS2X_DEBUG_PANEL=0
     bool m_showRegisters = true;
     unsigned int m_memoryAddress = 0x00100000u;
     unsigned int m_memoryBytes = 0x100u;

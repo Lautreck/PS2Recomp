@@ -2167,6 +2167,11 @@ namespace ps2recomp
                 }
 
                 Instruction inst = m_decoder->decodeInstruction(address, rawInstruction, !m_config.lowMemoryMode);
+                if (auto switchIt = m_config.switchPatches.find(address); switchIt != m_config.switchPatches.end())
+                {
+                    inst.switchName = switchIt->second.name;
+                    inst.switchRaw = switchIt->second.value;
+                }
 
                 auto mmioIt = m_config.mmioByInstructionAddress.find(address);
                 if (mmioIt != m_config.mmioByInstructionAddress.end())

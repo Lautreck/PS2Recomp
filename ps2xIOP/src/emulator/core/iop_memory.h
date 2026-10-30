@@ -22,8 +22,15 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
+        // Default sysmem window, bottom-up. 0x120000..0x1F0000 is 0xD0000, which is what
+        // sceSifAllocIopHeap's first block and the module loader both assume.
+        // TEKKEN4_SOUND=1 lowers the floor to SoundHeapFloor and bumps down from HeapLimit:
+        // zsiopdrv's AllocSysMemory(0xE9400) does not fit in 0xD0000 (it returned 0 and the
+        // driver filled from address 0). 0x80000 is still above the six boot IRX (zsiopdrv
+        // ends near 0x53000). Call stacks stay above HeapLimit.
         static constexpr uint32_t HeapBase = 0x00120000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
+        static constexpr uint32_t SoundHeapFloor = 0x00080000u;
 
         struct Allocation
         {
@@ -83,6 +90,8 @@ namespace ps2x::iop::detail
         std::unordered_map<uint32_t, uint32_t> m_hardware;
         std::vector<Allocation> m_allocations;
         uint32_t m_heapCursor = HeapBase;
+        uint32_t m_heapFloor = HeapBase;
+        bool m_topDown = false;
         uint32_t m_interruptStatus = 0;
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;

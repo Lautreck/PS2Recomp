@@ -21,6 +21,10 @@ namespace ps2x::iop::detail
     void IopRpcBridge::reset()
     {
         m_servers.clear();
+        m_userCmds = {};
+        m_cmdBuffer = 0u;
+        m_cmdBufferCount = 0u;
+        m_userPacket = 0u;
         m_nextDmaId = 1u;
         m_sifInitialized = false;
     }
@@ -143,15 +147,38 @@ namespace ps2x::iop::detail
         case 5:
         case 6:
         case 7:
-        case 8:
         case 9:
-        case 10:
         case 11:
         case 14: // InitRpc
         case 15:
         case 16:
             setV0(0);
             return true;
+        case 8: // sceSifSetCmdBuffer(buffer, count): the user-command handler table, returns the previous one
+        {
+            const uint32_t previous = m_cmdBuffer;
+            m_cmdBuffer = cpu.gpr[4];
+            m_cmdBufferCount = cpu.gpr[5];
+            setV0(previous);
+            return true;
+        }
+        case 10: // sceSifAddCmdHandler(cid, handler, harg)
+        {
+            const uint32_t cid = cpu.gpr[4];
+            const uint32_t handler = cpu.gpr[5];
+            const uint32_t harg = cpu.gpr[6];
+            if ((cid & 0x80000000u) == 0u && cid < m_userCmds.size())
+            {
+                m_userCmds[cid] = UserCmd{handler, harg, cpu.gpr[28]};
+                if (m_cmdBuffer != 0u && cid < m_cmdBufferCount)
+                {
+                    m_memory.write32(m_cmdBuffer + cid * 8u, handler);
+                    m_memory.write32(m_cmdBuffer + cid * 8u + 4u, harg);
+                }
+            }
+            setV0(0);
+            return true;
+        }
         case 12: // sceSifSendCmd
         case 13: // isceSifSendCmd
         {
@@ -345,5 +372,34 @@ namespace ps2x::iop::detail
     {
         const auto server = m_servers.find(sid);
         return server != m_servers.end() && server->second.function != 0u;
+    }
+
+    bool IopRpcBridge::stageUserCommand(uint32_t commandId,
+                                        const void *packet,
+                                        uint32_t packetSize,
+                                        uint32_t &packetAddress,
+                                        uint32_t &handler,
+                                        uint32_t &harg,
+                                        uint32_t &gp)
+    {
+        packetAddress = 0u;
+        handler = 0u;
+        harg = 0u;
+        gp = 0u;
+        if ((commandId & 0x80000000u) != 0u || commandId >= m_userCmds.size() || packet == nullptr ||
+            packetSize < 16u || packetSize > 112u)
+            return false;
+        const UserCmd &cmd = m_userCmds[commandId];
+        if (cmd.handler == 0u)
+            return false;
+        if (m_userPacket == 0u)
+            m_userPacket = m_memory.allocate(128u, 16u);
+        if (m_userPacket == 0u || !m_memory.writeRam(m_userPacket, packet, packetSize))
+            return false;
+        packetAddress = m_userPacket;
+        handler = cmd.handler;
+        harg = cmd.harg;
+        gp = cmd.gp;
+        return true;
     }
 }

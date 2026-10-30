@@ -3,8 +3,10 @@
 #include "ps2x/iop/iop_types.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
@@ -132,4 +134,29 @@ namespace ps2x::iop
 
         virtual void log(LogLevel level, std::string_view message) = 0;
     };
+
+    // Host mix from the IOP sound engine (48 kHz interleaved s16 stereo). The slot is one per process.
+    // Empty until the runtime registers a device. Playback is skipped when no function is set.
+    using MixedAudioFn = void (*)(const int16_t *interleavedStereo, size_t frames);
+    inline std::atomic<MixedAudioFn> &mixedAudioFnSlot()
+    {
+        static std::atomic<MixedAudioFn> fn{nullptr};
+        return fn;
+    }
+    inline void setMixedAudioFn(MixedAudioFn fn)
+    {
+        mixedAudioFnSlot().store(fn, std::memory_order_release);
+    }
+
+    // 32 SIF software registers (ps2sdk SIF_SREG, indices 0..31). The EE writes them with
+    // SIF_CMD_SET_SREG (cid 0x80000001, packet+16 = index, packet+20 = value). IOP sifcmd
+    // GetSreg/SetSreg (ordinals 6/7) read the same store. zsiopdrv spins until register 31 is non-zero.
+    void setSifSoftwareRegister(uint32_t index, uint32_t value) noexcept;
+    uint32_t sifSoftwareRegister(uint32_t index) noexcept;
+
+    // EE sceSifSendCmd with a user cid (bit 31 clear): runs the handler the IOP registered with
+    // sceSifAddCmdHandler on a copy of the 16..112-byte packet. The extra payload must already be in IOP RAM.
+    // False when no handler is registered for that cid.
+#define PS2X_IOP_HAS_USER_SIF_CMD 1
+    bool deliverEeUserSifCmd(uint32_t commandId, const void *packet, size_t packetSize) noexcept;
 }

@@ -46,6 +46,9 @@ namespace ps2recomp
         bool isMmio = false;
         uint32_t mmioAddress = 0;
         std::string disassembly;
+        // [patches] instruction with a switch: the alternative word and the runtime switch that selects it
+        std::string switchName;
+        uint32_t switchRaw = 0;
 
         struct
         {
@@ -136,6 +139,13 @@ namespace ps2recomp
         int32_t addend;
     };
 
+    // Runtime-switchable instruction patch ([patches] instructions entry with switch = "<name>")
+    struct SwitchPatch
+    {
+        uint32_t value = 0;
+        std::string name;
+    };
+
     // Jump table entry
     struct JumpTableEntry
     {
@@ -186,6 +196,7 @@ namespace ps2recomp
         bool patchCache = true;
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
+        std::unordered_map<uint32_t, SwitchPatch> switchPatches;
         std::vector<std::string> stubImplementations;
         std::vector<std::string> entryPointHints;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;

@@ -1,5 +1,7 @@
 #include "Common.h"
 #include "Pad.h"
+#include "runtime/ps2_input_latency.h"
+#include "runtime/ps2_graphics_settings.h"
 
 namespace ps2_stubs
 {
@@ -94,102 +96,167 @@ namespace ps2_stubs
             return -1;
         }
 
-        void applyGamepadState(PadInputState &state)
+        // nth available host gamepad (0 = the first). No gamepad exists until the
+        // window does: raylib's joystick query is only valid after that.
+        int findNthGamepad(int nth)
         {
-            if (!IsWindowReady())
+            if (nth < 0 || !IsWindowReady())
             {
-                return;
+                return -1;
             }
 
-            const int gamepad = findFirstGamepad();
-            if (gamepad < 0)
+            int seen = 0;
+            for (int i = 0; i < 4; ++i)
             {
-                return;
+                if (IsGamepadAvailable(i))
+                {
+                    if (seen == nth)
+                    {
+                        return i;
+                    }
+                    ++seen;
+                }
             }
-
-            // Raylib mapping (PS2 -> raylib buttons/axes):
-            // D-Pad -> LEFT_FACE_*, Cross/Circle/Square/Triangle -> RIGHT_FACE_*
-            // L1/R1 -> TRIGGER_1, L2/R2 -> TRIGGER_2, L3/R3 -> THUMB
-            // Select/Start -> MIDDLE_LEFT/MIDDLE_RIGHT
-            state.lx = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
-            state.ly = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y));
-            state.rx = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X));
-            state.ry = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
-
-            setButton(state, kPadBtnUp, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_UP));
-            setButton(state, kPadBtnDown, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN));
-            setButton(state, kPadBtnLeft, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT));
-            setButton(state, kPadBtnRight, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT));
-
-            setButton(state, kPadBtnCross, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN));
-            setButton(state, kPadBtnCircle, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT));
-            setButton(state, kPadBtnSquare, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT));
-            setButton(state, kPadBtnTriangle, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP));
-
-            setButton(state, kPadBtnL1, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1));
-            setButton(state, kPadBtnR1, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1));
-            setButton(state, kPadBtnL2, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2));
-            setButton(state, kPadBtnR2, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2));
-
-            setButton(state, kPadBtnL3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_THUMB));
-            setButton(state, kPadBtnR3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_THUMB));
-
-            setButton(state, kPadBtnSelect, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT));
-            setButton(state, kPadBtnStart, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT));
+            return -1;
         }
 
+        // Port 0 is the keyboard plus the first host gamepad, which is what
+        // scePadRead already fed it. Each later port is the next host gamepad.
+        // scePadPortOpen still succeeds when nothing is plugged in; libpad then
+        // reports that port disconnected (scePadStateDiscon) and scePadRead
+        // returns no packet. The keyboard layout preset ignores gamepads on
+        // every port; port 0 stays connected because the keyboard is there.
+        bool hostControllerConnected(int port)
+        {
+            if (port == 0)
+            {
+                return true;
+            }
+            const ps2_controls::Snap *snap = ps2_controls::publishedSnap();
+            if (snap && snap->ignoreGamepads)
+            {
+                return false;
+            }
+            return findNthGamepad(port) >= 0;
+        }
+
+        // Later ports, and the port-0 fallback when the backend declines.
+        // Stick bytes stay axisToByte (lround). Port 0's production path uses
+        // 128+axis*127 in ps2_pad.cpp. Buttons and sticks come from the shared
+        // snapshot (preset, overrides, deadzone, invert, swap, trigger axis).
+        void applyGamepadState(PadInputState &state, int gamepad)
+        {
+            if (!IsWindowReady() || gamepad < 0)
+            {
+                return;
+            }
+            const ps2_controls::Snap *snap = ps2_controls::publishedSnap();
+            if (!snap || snap->ignoreGamepads)
+            {
+                return;
+            }
+
+            bool down[18] = {};
+            const bool blockButtons = ps2_input_latency::gamepadButtonsBlocked();
+            if (!blockButtons)
+            {
+                for (int b = 1; b <= 17; ++b)
+                {
+                    down[b] = IsGamepadButtonDown(gamepad, b);
+                }
+            }
+            float axes[6];
+            for (int a = 0; a < 6; ++a)
+            {
+                axes[a] = GetGamepadAxisMovement(gamepad, a);
+            }
+
+            static bool signedL[4] = {};
+            static bool signedR[4] = {};
+            const int slot = gamepad & 3;
+            ps2_controls::StickFloats sticks;
+            const uint16_t pressed = ps2_controls::mapGamepad(*snap, down, axes, signedL[slot], signedR[slot], sticks,
+                                                             !blockButtons);
+            ps2_controls::swapSticksIf(*snap, sticks);
+            ps2_controls::invertAndDeadzone(*snap, sticks);
+            state.lx = axisToByte(sticks.lx);
+            state.ly = axisToByte(sticks.ly);
+            state.rx = axisToByte(sticks.rx);
+            state.ry = axisToByte(sticks.ry);
+            state.buttons = static_cast<uint16_t>(state.buttons & static_cast<uint16_t>(~pressed));
+        }
+
+        void applyKeyStick(const ps2_controls::Snap &snap, float x, float y, bool right, uint8_t &outX, uint8_t &outY)
+        {
+            if (x == 0.0f && y == 0.0f)
+            {
+                return;
+            }
+            if (right ? snap.invertRight : snap.invertLeft)
+            {
+                y = -y;
+            }
+            ps2_controls::applyRadialDeadzone(x, y, right ? snap.deadzoneRight : snap.deadzoneLeft);
+            outX = axisToByte(x);
+            outY = axisToByte(y);
+        }
+
+        // Fallback only (port 0 when the backend returns false). Same key table
+        // as the production path. Stick keys apply only in analog mode, and
+        // only when that stick's keys are actually down.
         void applyKeyboardState(PadInputState &state, bool allowAnalog)
         {
-            if (!IsWindowReady())
+            if (!IsWindowReady() || ps2_input_latency::padPostingSuppressed())
             {
                 return;
             }
-
-            // Keyboard mapping (PS2 -> keys):
-            // D-Pad: arrows, Square/Cross/Circle/Triangle: Z/X/C/V
-            // L1/R1: Q/E, L2/R2: 1/3, Start/Select: Enter/RightShift
-            // L3/R3: LeftCtrl/RightCtrl, Analog left: WASD
-            setButton(state, kPadBtnUp, IsKeyDown(KEY_UP));
-            setButton(state, kPadBtnDown, IsKeyDown(KEY_DOWN));
-            setButton(state, kPadBtnLeft, IsKeyDown(KEY_LEFT));
-            setButton(state, kPadBtnRight, IsKeyDown(KEY_RIGHT));
-
-            setButton(state, kPadBtnSquare, IsKeyDown(KEY_Z));
-            setButton(state, kPadBtnCross, IsKeyDown(KEY_X));
-            setButton(state, kPadBtnCircle, IsKeyDown(KEY_C));
-            setButton(state, kPadBtnTriangle, IsKeyDown(KEY_V));
-
-            setButton(state, kPadBtnL1, IsKeyDown(KEY_Q));
-            setButton(state, kPadBtnR1, IsKeyDown(KEY_E));
-            setButton(state, kPadBtnL2, IsKeyDown(KEY_ONE));
-            setButton(state, kPadBtnR2, IsKeyDown(KEY_THREE));
-
-            setButton(state, kPadBtnStart, IsKeyDown(KEY_ENTER));
-            setButton(state, kPadBtnSelect, IsKeyDown(KEY_RIGHT_SHIFT));
-            setButton(state, kPadBtnL3, IsKeyDown(KEY_LEFT_CONTROL));
-            setButton(state, kPadBtnR3, IsKeyDown(KEY_RIGHT_CONTROL));
-
-            if (!allowAnalog)
+            const ps2_controls::Snap *snap = ps2_controls::publishedSnap();
+            if (!snap)
             {
                 return;
             }
-
-            float ax = 0.0f;
-            float ay = 0.0f;
-            if (IsKeyDown(KEY_D))
-                ax += 1.0f;
-            if (IsKeyDown(KEY_A))
-                ax -= 1.0f;
-            if (IsKeyDown(KEY_S))
-                ay += 1.0f;
-            if (IsKeyDown(KEY_W))
-                ay -= 1.0f;
-
-            if (ax != 0.0f || ay != 0.0f)
+            for (int i = 0; i < snap->rlCount; ++i)
             {
-                state.lx = axisToByte(ax);
-                state.ly = axisToByte(ay);
+                const int key = snap->rlKeys[i].key;
+                if (key > 0 && IsKeyDown(key))
+                {
+                    setButton(state, snap->rlKeys[i].mask, true);
+                }
             }
+            if (!allowAnalog || snap->stickCount <= 0)
+            {
+                return;
+            }
+            float lx = 0.0f;
+            float ly = 0.0f;
+            float rx = 0.0f;
+            float ry = 0.0f;
+            for (int i = 0; i < snap->stickCount; ++i)
+            {
+                const ps2_controls::Snap::StickBind &bind = snap->sticks[i];
+                if (bind.key <= 0 || !IsKeyDown(bind.key))
+                {
+                    continue;
+                }
+                if (bind.stick == 0 && bind.axis == 0)
+                {
+                    lx += bind.value;
+                }
+                else if (bind.stick == 0)
+                {
+                    ly += bind.value;
+                }
+                else if (bind.axis == 0)
+                {
+                    rx += bind.value;
+                }
+                else
+                {
+                    ry += bind.value;
+                }
+            }
+            applyKeyStick(*snap, lx, ly, false, state.lx, state.ly);
+            applyKeyStick(*snap, rx, ry, true, state.rx, state.ry);
         }
 
         void resetPadStateLocked()
@@ -284,6 +351,15 @@ namespace ps2_stubs
                 portState = *sharedPortState;
             }
 
+            // Open, but no controller: libpad's padRead copies 0 bytes and returns 0.
+            // 0xFF is the idle SIO line (no ACK), so a caller that ignores the
+            // return does not see a digital/DualShock id or any button held.
+            if (!hostControllerConnected(port))
+            {
+                std::memset(outData, 0xFF, 32);
+                return false;
+            }
+
             PadInputState state;
             bool useOverride = false;
             {
@@ -298,20 +374,28 @@ namespace ps2_stubs
             bool usedBackend = false;
             if (!useOverride)
             {
-                uint8_t backendData[32]{};
-                if (runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
+                if (port == 0)
                 {
-                    state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));
-                    state.rx = backendData[4];
-                    state.ry = backendData[5];
-                    state.lx = backendData[6];
-                    state.ly = backendData[7];
-                    usedBackend = true;
+                    uint8_t backendData[32]{};
+                    if (runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
+                    {
+                        state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));
+                        state.rx = backendData[4];
+                        state.ry = backendData[5];
+                        state.lx = backendData[6];
+                        state.ly = backendData[7];
+                        usedBackend = true;
+                    }
+                    else
+                    {
+                        applyGamepadState(state, findFirstGamepad());
+                        applyKeyboardState(state, portState.analogMode);
+                    }
                 }
                 else
                 {
-                    applyGamepadState(state);
-                    applyKeyboardState(state, portState.analogMode);
+                    // The shared backend ignores the port and always samples pad 1.
+                    applyGamepadState(state, findNthGamepad(port));
                 }
             }
 
@@ -354,9 +438,14 @@ namespace ps2_stubs
     void scePadEnterPressMode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        if (!hostControllerConnected(port))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         std::lock_guard<std::mutex> lock(g_padStateMutex);
-        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
-                                                           static_cast<int>(getRegU32(ctx, 5)));
+        PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
         if (!portState || !portState->open)
         {
             setReturnS32(ctx, 0);
@@ -372,9 +461,14 @@ namespace ps2_stubs
     void scePadExitPressMode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        if (!hostControllerConnected(port))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         std::lock_guard<std::mutex> lock(g_padStateMutex);
-        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
-                                                           static_cast<int>(getRegU32(ctx, 5)));
+        PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
         if (!portState || !portState->open)
         {
             setReturnS32(ctx, 0);
@@ -436,9 +530,16 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        // Nothing to complete on an empty port. Busy would stall a game that
+        // waits for scePadReqStateComplete before it moves on.
+        if (!hostControllerConnected(port))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         std::lock_guard<std::mutex> lock(g_padStateMutex);
-        const PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
-                                                                 static_cast<int>(getRegU32(ctx, 5)));
+        const PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
         setReturnS32(ctx, static_cast<int32_t>(portState ? portState->reqState : 0u));
     }
 
@@ -454,11 +555,12 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        const bool connected = hostControllerConnected(port);
         std::lock_guard<std::mutex> lock(g_padStateMutex);
-        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
-                                                           static_cast<int>(getRegU32(ctx, 5)));
+        PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
         int32_t state = kPadStateDisconnected;
-        if (portState && portState->open)
+        if (portState && portState->open && connected)
         {
             if (portState->transientState != 0u)
             {
@@ -475,10 +577,15 @@ namespace ps2_stubs
 
     void scePadInfoAct(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        const int port = static_cast<int>(getRegU32(ctx, 4));
         const int32_t act = static_cast<int32_t>(getRegU32(ctx, 6));
+        if (!hostControllerConnected(port))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         std::lock_guard<std::mutex> lock(g_padStateMutex);
-        const PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
-                                                                 static_cast<int>(getRegU32(ctx, 5)));
+        const PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
         if (!portState || !portState->open)
         {
             setReturnS32(ctx, 0);
@@ -506,11 +613,16 @@ namespace ps2_stubs
         (void)rdram;
         (void)runtime;
 
+        const int port = static_cast<int>(getRegU32(ctx, 4));
         const int32_t infoMode = static_cast<int32_t>(getRegU32(ctx, 6)); // a2
         const int32_t index = static_cast<int32_t>(getRegU32(ctx, 7));    // a3
+        if (!hostControllerConnected(port))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         std::lock_guard<std::mutex> lock(g_padStateMutex);
-        const PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
-                                                                 static_cast<int>(getRegU32(ctx, 5)));
+        const PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
         if (!portState || !portState->open)
         {
             setReturnS32(ctx, 0);
@@ -553,9 +665,14 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        if (!hostControllerConnected(port))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         std::lock_guard<std::mutex> lock(g_padStateMutex);
-        const PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
-                                                                 static_cast<int>(getRegU32(ctx, 5)));
+        const PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
         setReturnS32(ctx, (portState && portState->open) ? 1 : 0);
     }
 
@@ -664,6 +781,13 @@ namespace ps2_stubs
             }
         });
 
+        if (ps2_input_latency::enabled())
+        {
+            const uint16_t activeLow = static_cast<uint16_t>(data[2] | (static_cast<uint16_t>(data[3]) << 8));
+            const uint64_t tick = runtime ? runtime->memory().gs().vsyncTick.load(std::memory_order_relaxed) : 0u;
+            ps2_input_latency::notePad(static_cast<uint16_t>(~activeLow), tick);
+        }
+
         setReturnS32(ctx, 1);
     }
 
@@ -689,6 +813,11 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
+        if (!hostControllerConnected(static_cast<int>(getRegU32(ctx, 4))))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         setReturnS32(ctx, 1);
     }
 
@@ -696,6 +825,11 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
+        if (!hostControllerConnected(static_cast<int>(getRegU32(ctx, 4))))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         setReturnS32(ctx, 1);
     }
 
@@ -703,9 +837,14 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        if (!hostControllerConnected(port))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         std::lock_guard<std::mutex> lock(g_padStateMutex);
-        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
-                                                           static_cast<int>(getRegU32(ctx, 5)));
+        PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
         if (portState && portState->open)
         {
             portState->buttonMask = static_cast<uint16_t>(getRegU32(ctx, 6));
@@ -719,9 +858,14 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        if (!hostControllerConnected(port))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         std::lock_guard<std::mutex> lock(g_padStateMutex);
-        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
-                                                           static_cast<int>(getRegU32(ctx, 5)));
+        PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
         if (!portState || !portState->open)
         {
             setReturnS32(ctx, 0);
@@ -738,9 +882,14 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        if (!hostControllerConnected(port))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         std::lock_guard<std::mutex> lock(g_padStateMutex);
-        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
-                                                           static_cast<int>(getRegU32(ctx, 5)));
+        PadPortState *portState = lookupPadPortStateLocked(port, static_cast<int>(getRegU32(ctx, 5)));
         if (portState && portState->open)
         {
             portState->reqState = static_cast<uint32_t>(getRegU32(ctx, 6) ? 1u : 0u);
@@ -753,6 +902,11 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
+        if (!hostControllerConnected(static_cast<int>(getRegU32(ctx, 4))))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         setReturnS32(ctx, 1);
     }
 

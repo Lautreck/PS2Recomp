@@ -4,11 +4,96 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace ps2x::iop::detail
 {
     namespace
     {
+        struct SchedCounts
+        {
+            bool init = false;
+            bool on = false;
+            uint64_t windowStart = 0;
+            uint64_t windowBegin = 0;
+            uint64_t windowWake = 0;
+            uint64_t windowEarly = 0;
+        };
+
+        SchedCounts &schedCounts()
+        {
+            static SchedCounts counts;
+            if (!counts.init)
+            {
+                counts.init = true;
+                if (const char *env = std::getenv("TEKKEN4_IOP_SCHED"))
+                    counts.on = env[0] == '1' && env[1] == '\0';
+            }
+            return counts;
+        }
+
+        size_t chainLength(const IopThread *head, bool delay)
+        {
+            size_t count = 0;
+            for (const IopThread *thread = head; thread != nullptr; thread = delay ? thread->delayLink : thread->readyLink)
+                ++count;
+            return count;
+        }
+
+        void noteBegin(uint64_t currentCycle, bool early, size_t threads, const IopThread *readyHead, const IopThread *delayHead)
+        {
+            SchedCounts &counts = schedCounts();
+            if (!counts.on)
+                return;
+            ++counts.windowBegin;
+            if (early)
+                ++counts.windowEarly;
+            if (counts.windowBegin == 1u && counts.windowStart == 0u)
+                counts.windowStart = currentCycle;
+            if (currentCycle < counts.windowStart + kIopClockHz)
+                return;
+            const uint64_t span = currentCycle - counts.windowStart;
+            const uint64_t perVblank = span == 0u ? 0u : counts.windowBegin * kVblankPeriodCycles / span;
+            std::fprintf(stderr,
+                         "[iop-sched] cycle=%llu span=%llu begin=%llu wake=%llu early=%llu per_vblank=%llu threads=%llu ready=%llu delay=%llu\n",
+                         static_cast<unsigned long long>(currentCycle),
+                         static_cast<unsigned long long>(span),
+                         static_cast<unsigned long long>(counts.windowBegin),
+                         static_cast<unsigned long long>(counts.windowWake),
+                         static_cast<unsigned long long>(counts.windowEarly),
+                         static_cast<unsigned long long>(perVblank),
+                         static_cast<unsigned long long>(threads),
+                         static_cast<unsigned long long>(chainLength(readyHead, false)),
+                         static_cast<unsigned long long>(chainLength(delayHead, true)));
+            counts.windowStart = currentCycle;
+            counts.windowBegin = 0;
+            counts.windowWake = 0;
+            counts.windowEarly = 0;
+        }
+
+        void noteWake()
+        {
+            SchedCounts &counts = schedCounts();
+            if (counts.on)
+                ++counts.windowWake;
+        }
+
+        bool runsBefore(const IopThread &left, const IopThread &right)
+        {
+            if (left.priority != right.priority)
+                return left.priority < right.priority;
+            return left.id < right.id;
+        }
+
+        bool wakesBefore(const IopThread &left, const IopThread &right)
+        {
+            if (left.wakeCycle != right.wakeCycle)
+                return left.wakeCycle < right.wakeCycle;
+            return left.id < right.id;
+        }
+
         uint32_t alignUp(uint32_t value, uint32_t alignment)
         {
             if (alignment <= 1u)
@@ -25,6 +110,9 @@ namespace ps2x::iop::detail
 
     void IopKernel::reset()
     {
+        m_readyHead = nullptr;
+        m_delayHead = nullptr;
+        m_nextDelayWake = ~uint64_t{0};
         m_threads.clear();
         m_semaphores.clear();
         m_eventFlags.clear();
@@ -32,6 +120,7 @@ namespace ps2x::iop::detail
         m_nextSemaphoreId = 1;
         m_nextEventFlagId = 1;
         m_currentThread = nullptr;
+        ++m_schedEpoch;
     }
 
     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
@@ -74,6 +163,8 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
+            removeReady(it->second);
+            removeDelay(it->second);
             if (it->second.stackBase != 0u)
                 (void)m_memory.freeAllocation(it->second.stackBase);
             m_threads.erase(it);
@@ -98,7 +189,7 @@ namespace ps2x::iop::detail
             thread.cpu.gpr[28] = cpu.gpr[28];
             thread.cpu.gpr[29] = alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
             thread.cpu.gpr[31] = kThreadReturnSentinel;
-            thread.state = IopThreadState::Ready;
+            assignState(thread, IopThreadState::Ready);
             setV0(0);
             return true;
         }
@@ -106,7 +197,7 @@ namespace ps2x::iop::detail
         case 9: // ExitDeleteThread
             if (m_currentThread != nullptr)
             {
-                m_currentThread->state = ordinal == 9 ? IopThreadState::Dead : IopThreadState::Dormant;
+                assignState(*m_currentThread, ordinal == 9 ? IopThreadState::Dead : IopThreadState::Dormant);
                 cpu.stopped = true;
                 cpu.yielded = true;
             }
@@ -122,7 +213,7 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
-            it->second.state = IopThreadState::Dormant;
+            assignState(it->second, IopThreadState::Dormant);
             setV0(0);
             return true;
         }
@@ -142,7 +233,15 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
-            it->second.priority = std::clamp<uint32_t>(cpu.gpr[5], 1u, 126u);
+            const uint32_t priority = std::clamp<uint32_t>(cpu.gpr[5], 1u, 126u);
+            if (it->second.queuedReady)
+            {
+                removeReady(it->second);
+                it->second.priority = priority;
+                insertReady(it->second);
+            }
+            else
+                it->second.priority = priority;
             setV0(0);
             return true;
         }
@@ -166,7 +265,7 @@ namespace ps2x::iop::detail
                 it->second.state == IopThreadState::Semaphore ||
                 it->second.state == IopThreadState::EventFlag)
             {
-                it->second.state = IopThreadState::Ready;
+                assignState(it->second, IopThreadState::Ready);
             }
             setV0(0);
             return true;
@@ -202,7 +301,7 @@ namespace ps2x::iop::detail
                 return true;
             }
             if (it->second.state == IopThreadState::Sleep)
-                it->second.state = IopThreadState::Ready;
+                assignState(it->second, IopThreadState::Ready);
             else
                 ++it->second.wakeupCount;
             setV0(0);
@@ -233,7 +332,7 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
-            it->second.state = IopThreadState::Suspended;
+            assignState(it->second, IopThreadState::Suspended);
             if (m_currentThread == &it->second)
                 cpu.yielded = true;
             setV0(0);
@@ -250,7 +349,7 @@ namespace ps2x::iop::detail
                 return true;
             }
             if (it->second.state == IopThreadState::Suspended)
-                it->second.state = IopThreadState::Ready;
+                assignState(it->second, IopThreadState::Ready);
             setV0(0);
             return true;
         }
@@ -410,7 +509,7 @@ namespace ps2x::iop::detail
                 setV0(-419);
             else if (m_currentThread != nullptr)
             {
-                m_currentThread->state = IopThreadState::Semaphore;
+                assignState(*m_currentThread, IopThreadState::Semaphore);
                 m_currentThread->waitId = id;
                 cpu.yielded = true;
                 setV0(0);
@@ -466,7 +565,7 @@ namespace ps2x::iop::detail
         if (best != nullptr && semaphore != m_semaphores.end() && semaphore->second.current > 0)
         {
             --semaphore->second.current;
-            best->state = IopThreadState::Ready;
+            assignState(*best, IopThreadState::Ready);
             best->waitId = 0;
         }
     }
@@ -492,7 +591,7 @@ namespace ps2x::iop::detail
             thread.cpu.gpr[2] = 0u;
             if ((thread.waitMode & 0x10u) != 0u)
                 event.bits = 0u;
-            thread.state = IopThreadState::Ready;
+            assignState(thread, IopThreadState::Ready);
             thread.waitId = 0;
             thread.waitBits = 0;
             thread.waitMode = 0;
@@ -553,7 +652,7 @@ namespace ps2x::iop::detail
             {
                 if (thread.state == IopThreadState::EventFlag && thread.waitId == id)
                 {
-                    thread.state = IopThreadState::Ready;
+                    assignState(thread, IopThreadState::Ready);
                     thread.waitId = 0;
                     thread.cpu.gpr[2] = static_cast<uint32_t>(-1);
                 }
@@ -609,7 +708,7 @@ namespace ps2x::iop::detail
                 setV0(-418);
             else if (m_currentThread != nullptr)
             {
-                m_currentThread->state = IopThreadState::EventFlag;
+                assignState(*m_currentThread, IopThreadState::EventFlag);
                 m_currentThread->waitId = event->second.id;
                 m_currentThread->waitBits = bits;
                 m_currentThread->waitMode = mode;
@@ -656,7 +755,7 @@ namespace ps2x::iop::detail
     {
         if (m_currentThread == nullptr)
             return;
-        m_currentThread->state = IopThreadState::Sleep;
+        assignState(*m_currentThread, IopThreadState::Sleep);
         cpu.yielded = true;
     }
 
@@ -664,33 +763,112 @@ namespace ps2x::iop::detail
     {
         if (m_currentThread == nullptr)
             return;
+        removeReady(*m_currentThread);
+        removeDelay(*m_currentThread);
         m_currentThread->wakeCycle = wakeCycle;
         m_currentThread->state = IopThreadState::Delay;
+        insertDelay(*m_currentThread);
         cpu.yielded = true;
+    }
+
+    void IopKernel::assignState(IopThread &thread, IopThreadState state)
+    {
+        if (thread.state == state)
+            return;
+        if (thread.state == IopThreadState::Ready)
+            removeReady(thread);
+        else if (thread.state == IopThreadState::Delay)
+            removeDelay(thread);
+        thread.state = state;
+        if (state == IopThreadState::Ready)
+            insertReady(thread);
+        else if (state == IopThreadState::Delay)
+            insertDelay(thread);
+    }
+
+    void IopKernel::insertReady(IopThread &thread)
+    {
+        if (thread.queuedReady)
+            return;
+        // Every way to make a thread runnable ends here, so the idle-skip cache cannot miss one.
+        ++m_schedEpoch;
+        thread.queuedReady = true;
+        IopThread **link = &m_readyHead;
+        while (*link != nullptr && !runsBefore(thread, **link))
+            link = &(*link)->readyLink;
+        thread.readyLink = *link;
+        *link = &thread;
+    }
+
+    void IopKernel::removeReady(IopThread &thread)
+    {
+        if (!thread.queuedReady)
+            return;
+        IopThread **link = &m_readyHead;
+        while (*link != nullptr && *link != &thread)
+            link = &(*link)->readyLink;
+        if (*link == &thread)
+            *link = thread.readyLink;
+        thread.readyLink = nullptr;
+        thread.queuedReady = false;
+    }
+
+    void IopKernel::insertDelay(IopThread &thread)
+    {
+        if (thread.queuedDelay)
+            return;
+        thread.queuedDelay = true;
+        IopThread **link = &m_delayHead;
+        while (*link != nullptr && !wakesBefore(thread, **link))
+            link = &(*link)->delayLink;
+        thread.delayLink = *link;
+        *link = &thread;
+        m_nextDelayWake = m_delayHead->wakeCycle;
+    }
+
+    void IopKernel::removeDelay(IopThread &thread)
+    {
+        if (!thread.queuedDelay)
+            return;
+        IopThread **link = &m_delayHead;
+        while (*link != nullptr && *link != &thread)
+            link = &(*link)->delayLink;
+        if (*link == &thread)
+            *link = thread.delayLink;
+        thread.delayLink = nullptr;
+        thread.queuedDelay = false;
+        m_nextDelayWake = m_delayHead != nullptr ? m_delayHead->wakeCycle : ~uint64_t{0};
+    }
+
+    void IopKernel::promoteDueDelays(uint64_t currentCycle)
+    {
+        while (m_delayHead != nullptr && m_delayHead->wakeCycle <= currentCycle)
+        {
+            IopThread *thread = m_delayHead;
+            m_delayHead = thread->delayLink;
+            thread->delayLink = nullptr;
+            thread->queuedDelay = false;
+            thread->state = IopThreadState::Ready;
+            insertReady(*thread);
+        }
+        m_nextDelayWake = m_delayHead != nullptr ? m_delayHead->wakeCycle : ~uint64_t{0};
     }
 
     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
     {
-        for (auto &[id, thread] : m_threads)
-        {
-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
-                thread.state = IopThreadState::Ready;
-        }
-
-        IopThread *next = nullptr;
-        for (auto &[id, thread] : m_threads)
-        {
-            if (thread.state != IopThreadState::Ready)
-                continue;
-            if (next == nullptr || thread.priority < next->priority ||
-                (thread.priority == next->priority && thread.id < next->id))
-                next = &thread;
-        }
-        if (next == nullptr)
+        const bool early = currentCycle < m_nextDelayWake;
+        if (!early)
+            promoteDueDelays(currentCycle);
+        noteBegin(currentCycle, early, m_threads.size(), m_readyHead, m_delayHead);
+        if (m_readyHead == nullptr)
             return nullptr;
 
-        m_currentThread = next;
+        IopThread *next = m_readyHead;
+        m_readyHead = next->readyLink;
+        next->readyLink = nullptr;
+        next->queuedReady = false;
         next->state = IopThreadState::Running;
+        m_currentThread = next;
         next->cpu.stopped = false;
         next->cpu.yielded = false;
         return next;
@@ -698,21 +876,16 @@ namespace ps2x::iop::detail
 
     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
     {
-        uint64_t nextWake = fallback;
-        for (const auto &[id, thread] : m_threads)
-        {
-            if (thread.state == IopThreadState::Delay)
-                nextWake = std::min(nextWake, thread.wakeCycle);
-        }
-        return nextWake;
+        noteWake();
+        return std::min(fallback, m_nextDelayWake);
     }
 
     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
     {
         if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
-            thread.state = IopThreadState::Dormant;
+            assignState(thread, IopThreadState::Dormant);
         else if (thread.state == IopThreadState::Running)
-            thread.state = IopThreadState::Ready;
+            assignState(thread, IopThreadState::Ready);
         m_currentThread = nullptr;
         cleanupDeadThreads();
     }
@@ -726,6 +899,8 @@ namespace ps2x::iop::detail
                 ++thread;
                 continue;
             }
+            removeReady(thread->second);
+            removeDelay(thread->second);
             if (thread->second.stackBase != 0u)
                 (void)m_memory.freeAllocation(thread->second.stackBase);
             thread = m_threads.erase(thread);
@@ -738,7 +913,7 @@ namespace ps2x::iop::detail
         {
             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
             if (pc >= base && pc < base + size)
-                thread.state = IopThreadState::Dead;
+                assignState(thread, IopThreadState::Dead);
         }
     }
 }

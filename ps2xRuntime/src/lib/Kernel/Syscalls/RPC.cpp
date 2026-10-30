@@ -974,16 +974,23 @@ namespace ps2_syscalls
         uint32_t packetAddr = getRegU32(ctx, 5);
         uint32_t packetSize = getRegU32(ctx, 6);
         uint32_t srcExtra = getRegU32(ctx, 7);
+        // ee-gcc EABI passes args 5 and 6 (IOP destination, size of the extra payload) in t0/t1, not on the
+        // stack. The payload goes to IOP RAM; the caller (a game override) then runs the IOP handler.
+        const uint32_t destExtra = getRegU32(ctx, 8);
+        const uint32_t sizeExtra = getRegU32(ctx, 9);
 
-        uint32_t sp = getRegU32(ctx, 29);
-        uint32_t destExtra = 0;
-        uint32_t sizeExtra = 0;
-        readStackU32(rdram, sp, 0x10, destExtra);
-        readStackU32(rdram, sp, 0x14, sizeExtra);
-
-        if (sizeExtra > 0 && srcExtra && destExtra)
+        if (sizeExtra > 0u && srcExtra != 0u && destExtra != 0u)
         {
-            rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra);
+            const uint8_t *src = getConstMemPtr(rdram, srcExtra);
+            const uint8_t *last = getConstMemPtr(rdram, srcExtra + sizeExtra - 1u);
+            const bool span = src && last && last >= src &&
+                              static_cast<size_t>(last - src) + 1u == static_cast<size_t>(sizeExtra);
+            if (!span || !runtime || !runtime->isIopMemoryRange(destExtra, sizeExtra) ||
+                !runtime->writeIopMemory(destExtra, src, sizeExtra))
+            {
+                setReturnS32(ctx, 0);
+                return;
+            }
         }
 
         static int logCount = 0;

@@ -16,6 +16,8 @@ extern "C"
 }
 #endif
 
+#include <algorithm>
+#include <cstring>
 #include <deque>
 #include <memory>
 
@@ -2007,6 +2009,9 @@ namespace ps2_stubs
         const uint32_t innerSize = static_cast<uint32_t>(iVar2_signed) - 0x118u;
 
         mpegGuestWrite32(rdram, param_1 + 0x40, uVar3);
+        // sys word 0 is libmpeg's end-of-stream flag: sceMpegIsEnd returns it, and games link their own copy of
+        // that function, so it must start cleared (the work area may hold anything).
+        mpegGuestWrite32(rdram, uVar3 + 0x00, 0u);
 
         const uint32_t a1_init = uVar3 + 0x118u;
         mpegGuestWrite32(rdram, puVar4 + 0x0, a1_init);
@@ -2569,5 +2574,139 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         getPlaybackState(mpegAddr).imageBufferAddr = imageBufferAddr;
         setReturnS32(ctx, 0);
+    }
+
+#if PS2X_HAS_FFMPEG
+    namespace
+    {
+        // One FFmpeg "ipu" decoder per picture size (intra pictures: no state carries over between them).
+        struct IpuPictureDecoder
+        {
+            AVCodecContext *context = nullptr;
+            AVFrame *frame = nullptr;
+            AVPacket *packet = nullptr;
+            int width = 0;
+            int height = 0;
+
+            ~IpuPictureDecoder()
+            {
+                av_packet_free(&packet);
+                av_frame_free(&frame);
+                avcodec_free_context(&context);
+            }
+
+            bool open(int w, int h)
+            {
+                if (context && width == w && height == h)
+                    return true;
+                avcodec_free_context(&context);
+                const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_IPU);
+                if (!codec)
+                    return false;
+                context = avcodec_alloc_context3(codec);
+                if (!context)
+                    return false;
+                context->width = w;
+                context->height = h;
+                context->thread_count = 1;
+                if (avcodec_open2(context, codec, nullptr) < 0)
+                {
+                    avcodec_free_context(&context);
+                    return false;
+                }
+                if (!frame)
+                    frame = av_frame_alloc();
+                if (!packet)
+                    packet = av_packet_alloc();
+                width = w;
+                height = h;
+                return frame && packet;
+            }
+
+            bool decode(const uint8_t *data, size_t size)
+            {
+                std::vector<uint8_t> buffer(size + AV_INPUT_BUFFER_PADDING_SIZE, 0u);
+                std::memcpy(buffer.data(), data, size);
+                av_packet_unref(packet);
+                packet->data = buffer.data();
+                packet->size = static_cast<int>(size);
+                if (avcodec_send_packet(context, packet) < 0)
+                    return false;
+                return avcodec_receive_frame(context, frame) == 0;
+            }
+        };
+
+        // The IPU's YCbCr -> RGB conversion (fixed point, BT.601 with the video-range offsets).
+        void ipuColourConvert(int y, int cb, int cr, uint8_t *rgba)
+        {
+            const int lum = (0x95 * std::max(0, y - 16)) >> 6;
+            const int rcr = (0xCC * (cr - 128)) >> 6;
+            const int gcr = (-0x68 * (cr - 128)) >> 6;
+            const int gcb = (-0x32 * (cb - 128)) >> 6;
+            const int bcb = (0x102 * (cb - 128)) >> 6;
+            rgba[0] = static_cast<uint8_t>(std::clamp((lum + rcr + 1) >> 1, 0, 255));
+            rgba[1] = static_cast<uint8_t>(std::clamp((lum + gcr + gcb + 1) >> 1, 0, 255));
+            rgba[2] = static_cast<uint8_t>(std::clamp((lum + bcb + 1) >> 1, 0, 255));
+            rgba[3] = 0x80u;
+        }
+    }
+#endif
+
+    bool decodeIpuIntraPicture(const uint8_t *data, size_t size, uint32_t mbWidth, uint32_t mbHeight, uint8_t *rgba32Out)
+    {
+#if PS2X_HAS_FFMPEG
+        if (!data || !rgba32Out || size < 5u || mbWidth == 0u || mbHeight == 0u)
+            return false;
+        configureFfmpegLogLevel();
+        thread_local IpuPictureDecoder decoder;
+        if (!decoder.open(static_cast<int>(mbWidth * 16u), static_cast<int>(mbHeight * 16u)))
+            return false;
+
+        // FFmpeg wants exactly the end code after the macroblocks; encoders may put stuffing bytes in between
+        // (and more codes after it), which the IPU ignores. Cut after the last end code, then drop stuffing.
+        static const uint8_t kEndCode[4] = {0x00u, 0x00u, 0x01u, 0xB0u};
+        size_t end = size;
+        for (size_t i = size - 4u + 1u; i-- > 0u;)
+            if (std::memcmp(data + i, kEndCode, 4u) == 0)
+            {
+                end = i;
+                break;
+            }
+        std::vector<uint8_t> picture;
+        bool decoded = false;
+        for (size_t drop = 0u; drop <= 8u && drop < end && !decoded; ++drop)
+        {
+            picture.assign(data, data + end - drop);
+            picture.insert(picture.end(), kEndCode, kEndCode + 4u);
+            decoded = decoder.decode(picture.data(), picture.size());
+        }
+        if (!decoded)
+            return false;
+
+        const AVFrame *f = decoder.frame;
+        if (f->format != AV_PIX_FMT_YUV420P)
+            return false;
+        for (uint32_t mby = 0u; mby < mbHeight; ++mby)
+            for (uint32_t mbx = 0u; mbx < mbWidth; ++mbx)
+            {
+                uint8_t *mb = rgba32Out + (static_cast<size_t>(mby) * mbWidth + mbx) * 1024u;
+                for (uint32_t y = 0u; y < 16u; ++y)
+                {
+                    const uint8_t *lumaRow = f->data[0] + static_cast<size_t>(mby * 16u + y) * f->linesize[0] + mbx * 16u;
+                    const uint8_t *cbRow = f->data[1] + static_cast<size_t>(mby * 8u + y / 2u) * f->linesize[1] + mbx * 8u;
+                    const uint8_t *crRow = f->data[2] + static_cast<size_t>(mby * 8u + y / 2u) * f->linesize[2] + mbx * 8u;
+                    for (uint32_t x = 0u; x < 16u; ++x)
+                        ipuColourConvert(lumaRow[x], cbRow[x / 2u], crRow[x / 2u], mb + (y * 16u + x) * 4u);
+                }
+            }
+        return true;
+#else
+        (void)data;
+        (void)size;
+        (void)mbWidth;
+        (void)mbHeight;
+        (void)rgba32Out;
+        return false;
+#endif
     }
 }

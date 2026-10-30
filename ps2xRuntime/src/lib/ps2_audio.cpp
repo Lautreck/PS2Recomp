@@ -1,7 +1,16 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include "ps2x/iop/iop_host.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
 #include <vector>
 
 namespace
@@ -325,4 +334,319 @@ void PS2AudioBackend::stopAll()
     }
     m_impl->activeSounds.clear();
 #endif
+}
+
+std::mutex g_movieMutex;
+std::vector<int16_t> g_moviePcm;
+
+namespace
+{
+#if !defined(PLATFORM_VITA)
+    // Playback queue between the game thread (push) and raylib's audio thread (pull, stream callback).
+    // UpdateAudioStream pads every write up to the stream's sub-buffer (device rate / 30 = 1600 frames at 48 kHz)
+    // with silence, so the old 1024-frame writes played ~36 % silence in 12 ms gaps (choppy sound, unintelligible
+    // movie voices) and fell behind until the queue dropped whole seconds. The device now pulls what it needs.
+    // Never destroyed: the audio thread can still call in during static destruction.
+    class DeviceQueue
+    {
+    public:
+        static constexpr size_t kTargetFrames = 2048u; // ~43 ms buffered ahead of the device
+        static constexpr size_t kMaxFrames = 9600u;    // 200 ms: after a stall, cut back to the target
+
+        void push(const int16_t *pcm, size_t frames)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_read != 0u && m_read * 2u >= m_samples.size())
+            {
+                m_samples.erase(m_samples.begin(), m_samples.begin() + static_cast<std::ptrdiff_t>(m_read));
+                m_read = 0u;
+            }
+            m_samples.insert(m_samples.end(), pcm, pcm + frames * 2u);
+            const size_t level = levelLocked();
+            if (level > kMaxFrames)
+            {
+                m_read += (level - kTargetFrames) * 2u;
+                m_dropped += level - kTargetFrames;
+                m_phase = 0.0;
+            }
+        }
+
+        // Fills exactly `frames` frames. Around the target level the queue plays up to 5 % faster or slower (linear
+        // interpolation), so a guest clock running ahead doesn't build latency and one running behind doesn't gap.
+        // An empty queue plays silence and waits for the target level again instead of crackling at the edge.
+        void pull(int16_t *out, size_t frames)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const size_t level = levelLocked();
+            if (!m_primed && level >= kTargetFrames)
+                m_primed = true;
+            size_t written = 0u;
+            double rate = 1.0;
+            if (m_primed)
+            {
+                const double over = (static_cast<double>(level) - static_cast<double>(kTargetFrames)) /
+                                    static_cast<double>(kTargetFrames);
+                rate = 1.0 + std::clamp(over * 0.1, -0.05, 0.05);
+                const int16_t *in = m_samples.data() + m_read;
+                double position = m_phase;
+                for (; written < frames; ++written, position += rate)
+                {
+                    const size_t index = static_cast<size_t>(position);
+                    if (index + 1u >= level)
+                        break;
+                    const double fraction = position - static_cast<double>(index);
+                    for (size_t side = 0u; side < 2u; ++side)
+                    {
+                        const double a = in[index * 2u + side], b = in[(index + 1u) * 2u + side];
+                        out[written * 2u + side] = static_cast<int16_t>(std::lround(a + (b - a) * fraction));
+                    }
+                }
+                const size_t consumed = std::min(level, static_cast<size_t>(position));
+                m_phase = position - static_cast<double>(consumed);
+                m_read += consumed * 2u;
+                if (written < frames)
+                    m_primed = false;
+            }
+            if (written < frames)
+            {
+                std::memset(out + written * 2u, 0, (frames - written) * 4u);
+                m_missing += frames - written;
+            }
+            logStats(frames, level, rate);
+        }
+
+    private:
+        size_t levelLocked() const { return (m_samples.size() - m_read) / 2u; }
+
+        // TEKKEN4_AUDIO_STATS=1: every ~5 s of device time, frames the device asked for, frames it got as silence
+        // (underrun), frames cut after a stall, the queue level range and the playback rate range.
+        void logStats(size_t frames, size_t level, double rate)
+        {
+            static const bool enabled = std::getenv("TEKKEN4_AUDIO_STATS") != nullptr;
+            if (!enabled)
+                return;
+            m_statPulled += frames;
+            m_statMinLevel = std::min(m_statMinLevel, level);
+            m_statMaxLevel = std::max(m_statMaxLevel, level);
+            m_statMinRate = std::min(m_statMinRate, rate);
+            m_statMaxRate = std::max(m_statMaxRate, rate);
+            if (m_statPulled < 240000u)
+                return;
+            std::fprintf(stderr, "[audio-device] pulled=%zu missing=%zu dropped=%zu level=%zu-%zu rate=%.3f-%.3f\n",
+                         m_statPulled, m_missing, m_dropped, m_statMinLevel, m_statMaxLevel, m_statMinRate,
+                         m_statMaxRate);
+            m_statPulled = m_missing = m_dropped = m_statMaxLevel = 0u;
+            m_statMinLevel = SIZE_MAX;
+            m_statMinRate = m_statMaxRate = 1.0;
+        }
+
+        std::mutex m_mutex;
+        std::vector<int16_t> m_samples;
+        size_t m_read = 0u; // samples already played from the front of m_samples
+        double m_phase = 0.0;
+        bool m_primed = false;
+        size_t m_missing = 0u, m_dropped = 0u;
+        size_t m_statPulled = 0u, m_statMinLevel = SIZE_MAX, m_statMaxLevel = 0u;
+        double m_statMinRate = 1.0, m_statMaxRate = 1.0;
+    };
+
+    DeviceQueue &deviceQueue()
+    {
+        static DeviceQueue *queue = new DeviceQueue();
+        return *queue;
+    }
+
+    void onDeviceRequest(void *buffer, unsigned int frames)
+    {
+        deviceQueue().pull(static_cast<int16_t *>(buffer), frames);
+    }
+#endif
+
+    // 48 kHz s16 stereo from the IOP mixer (ps2x::iop::setMixedAudioFn). The WAV is the check Claude can read;
+    // the raylib stream plays it through DeviceQueue.
+    class MixedOutput
+    {
+    public:
+        void push(const int16_t *pcm, size_t frames)
+        {
+            if (!pcm || frames == 0u)
+                return;
+            std::lock_guard<std::mutex> lock(m_mutex);
+            openWav();
+            if (m_wav)
+            {
+                m_wav.write(reinterpret_cast<const char *>(pcm), static_cast<std::streamsize>(frames * 4u));
+                m_frames += static_cast<uint64_t>(frames);
+                m_sinceFlush += static_cast<uint32_t>(frames);
+                if (m_sinceFlush >= 48000u)
+                {
+                    patchHeader();
+                    m_wav.flush();
+                    m_sinceFlush = 0u;
+                }
+            }
+#if !defined(PLATFORM_VITA)
+            pumpDevice(pcm, frames);
+#endif
+        }
+
+        ~MixedOutput()
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_wav)
+            {
+                patchHeader();
+                m_wav.flush();
+            }
+        }
+
+    private:
+        static void writeLe32(uint8_t *p, uint32_t value)
+        {
+            p[0] = static_cast<uint8_t>(value);
+            p[1] = static_cast<uint8_t>(value >> 8);
+            p[2] = static_cast<uint8_t>(value >> 16);
+            p[3] = static_cast<uint8_t>(value >> 24);
+        }
+
+        void openWav()
+        {
+            if (m_wavTried)
+                return;
+            m_wavTried = true;
+            const char *path = std::getenv("TEKKEN4_SOUND_WAV");
+            if (!path || path[0] == '\0')
+                return;
+            std::error_code ec;
+            const std::filesystem::path file(path);
+            if (file.has_parent_path())
+                std::filesystem::create_directories(file.parent_path(), ec);
+            m_wav.open(file, std::ios::binary | std::ios::trunc);
+            if (!m_wav)
+            {
+                std::fprintf(stderr, "[tekken4] sound wav open failed %s\n", path);
+                return;
+            }
+            uint8_t header[44] = {};
+            m_wav.write(reinterpret_cast<const char *>(header), 44);
+            patchHeader();
+            m_wav.flush();
+            std::fprintf(stderr, "[tekken4] sound wav %s\n", path);
+        }
+
+        void patchHeader()
+        {
+            if (!m_wav)
+                return;
+            const uint64_t dataBytes64 = m_frames * 4u;
+            const uint32_t dataBytes = dataBytes64 > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<uint32_t>(dataBytes64);
+            const uint32_t fileSize = 36u + dataBytes;
+            uint8_t h[44] = {};
+            h[0] = 'R'; h[1] = 'I'; h[2] = 'F'; h[3] = 'F';
+            writeLe32(h + 4, fileSize);
+            h[8] = 'W'; h[9] = 'A'; h[10] = 'V'; h[11] = 'E';
+            h[12] = 'f'; h[13] = 'm'; h[14] = 't'; h[15] = ' ';
+            writeLe32(h + 16, 16u);
+            h[20] = 1; h[22] = 2;
+            writeLe32(h + 24, 48000u);
+            writeLe32(h + 28, 48000u * 4u);
+            h[32] = 4; h[34] = 16;
+            h[36] = 'd'; h[37] = 'a'; h[38] = 't'; h[39] = 'a';
+            writeLe32(h + 40, dataBytes);
+            const auto end = m_wav.tellp();
+            m_wav.seekp(0);
+            m_wav.write(reinterpret_cast<const char *>(h), 44);
+            m_wav.seekp(end);
+        }
+
+#if !defined(PLATFORM_VITA)
+        void pumpDevice(const int16_t *pcm, size_t frames)
+        {
+            if (!m_deviceGaveUp && !m_streamOn && IsAudioDeviceReady())
+            {
+                m_stream = LoadAudioStream(48000, 16, 2);
+                if (m_stream.sampleRate == 48000)
+                {
+                    SetAudioStreamCallback(m_stream, &onDeviceRequest);
+                    PlayAudioStream(m_stream);
+                    m_streamOn = true;
+                    std::fprintf(stderr, "[tekken4] sound device 48000 Hz stereo (pulled by the audio thread)\n");
+                }
+                else
+                    m_deviceGaveUp = true;
+            }
+            if (m_streamOn)
+                deviceQueue().push(pcm, frames);
+        }
+
+        AudioStream m_stream{};
+        bool m_streamOn = false;
+        bool m_deviceGaveUp = false;
+#endif
+        std::mutex m_mutex;
+        std::ofstream m_wav;
+        bool m_wavTried = false;
+        uint64_t m_frames = 0;
+        uint32_t m_sinceFlush = 0;
+    };
+
+    MixedOutput &mixedOutput()
+    {
+        static MixedOutput output;
+        return output;
+    }
+
+    void onMixedAudio(const int16_t *pcm, size_t frames)
+    {
+        std::vector<int16_t> mixed;
+        const int16_t *played = pcm;
+        {
+            std::lock_guard<std::mutex> lock(g_movieMutex);
+            if (!g_moviePcm.empty() && pcm && frames != 0u)
+            {
+                mixed.assign(pcm, pcm + frames * 2u);
+                const size_t have = g_moviePcm.size() / 2u;
+                const size_t n = frames < have ? frames : have;
+                for (size_t i = 0; i < n * 2u; ++i)
+                {
+                    const int32_t sum = static_cast<int32_t>(mixed[i]) + static_cast<int32_t>(g_moviePcm[i]);
+                    mixed[i] = static_cast<int16_t>(sum > 32767 ? 32767 : sum < -32768 ? -32768 : sum);
+                }
+                g_moviePcm.erase(g_moviePcm.begin(), g_moviePcm.begin() + static_cast<std::ptrdiff_t>(n * 2u));
+                played = mixed.data();
+            }
+        }
+        mixedOutput().push(played, frames);
+    }
+
+    struct MixedAudioRegistration
+    {
+        MixedAudioRegistration()
+        {
+            ps2x::iop::setMixedAudioFn(&onMixedAudio);
+        }
+        ~MixedAudioRegistration()
+        {
+            ps2x::iop::setMixedAudioFn(nullptr);
+        }
+    };
+
+    MixedAudioRegistration g_mixedAudioRegistration;
+}
+
+void ps2PushMoviePcm(const int16_t *stereoInterleaved, size_t frames)
+{
+    if (!stereoInterleaved || frames == 0u)
+        return;
+    std::lock_guard<std::mutex> lock(g_movieMutex);
+    constexpr size_t kMaxFrames = 48000u * 8u;
+    g_moviePcm.insert(g_moviePcm.end(), stereoInterleaved, stereoInterleaved + frames * 2u);
+    if (g_moviePcm.size() / 2u > kMaxFrames)
+        g_moviePcm.erase(g_moviePcm.begin(), g_moviePcm.end() - static_cast<std::ptrdiff_t>(kMaxFrames * 2u));
+}
+
+void ps2ClearMoviePcm()
+{
+    std::lock_guard<std::mutex> lock(g_movieMutex);
+    g_moviePcm.clear();
 }

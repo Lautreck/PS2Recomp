@@ -7,6 +7,10 @@
 
 namespace GSMem
 {
+    // Copies one 8 KiB page into dst. Drawing threads use a snapshot when an upload has replaced the
+    // live page underneath a primitive that was already queued (see GSCpuBackend). Other callers copy vram.
+    void CopyStablePage(uint8_t *dst, const uint8_t *vram, uint32_t pageBase) noexcept;
+
     class TexturePageCache
     {
     public:
@@ -24,7 +28,7 @@ namespace GSMem
             const uint32_t pageBase = byteAddress & ~(kPageSize - 1u);
             if (m_pageBase != pageBase)
             {
-                std::memcpy(m_bytes.data(), vram + pageBase, kPageSize);
+                CopyStablePage(m_bytes.data(), vram, pageBase);
                 m_pageBase = pageBase;
             }
             return m_bytes.data() + (byteAddress & (kPageSize - 1u));

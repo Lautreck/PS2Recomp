@@ -1,11 +1,15 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#if defined(PS2X_GS_GL)
+#include "runtime/gs/gs_threaded_backend.h"
+#endif
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -105,8 +109,23 @@ namespace
 }
 
 
+namespace
+{
+    // PS2X_GS_BACKEND=gl draws on the GPU: the God of War port's OpenGL renderer on its own thread
+    // (GSThreadedBackend(GSHwBackend)). Anything else, or a build without PS2X_GS_GL: the CPU renderer.
+    std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend()
+    {
+#if defined(PS2X_GS_GL)
+        const char *backend = std::getenv("PS2X_GS_BACKEND");
+        if (backend && std::strcmp(backend, "gl") == 0)
+            return GSThreadedBackend::MakeDefault();
+#endif
+        return std::make_unique<GSCpuBackend>();
+    }
+}
+
 GS::GS()
-    : m_backend(std::make_unique<GSCpuBackend>())
+    : m_backend(makeDefaultRasterBackend())
 {
     reset();
 }
@@ -117,7 +136,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
     if (!m_backend)
-        m_backend = std::make_unique<GSCpuBackend>();
+        m_backend = makeDefaultRasterBackend();
     m_backend->Initialize(vram, vramSize);
     reset();
 }
@@ -159,6 +178,7 @@ void GS::reset()
     m_preferredDisplaySourceFrame = {};
     m_preferredDisplayDestFbp = 0;
     m_hasPreferredDisplaySource = false;
+    m_displayWriteField = -1;
     if (m_backend)
     {
         m_backend->Flush();
@@ -521,6 +541,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     request.preferredSource = m_preferredDisplaySourceFrame;
     request.preferredDestFbp = m_preferredDisplayDestFbp;
     request.hasPreferredSource = m_hasPreferredDisplaySource;
+    request.displayField = m_displayWriteField;
     return request;
 }
 
@@ -610,7 +631,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        // Backends pad narrower frames to a 640-pixel stride; a frame above 1x internal resolution is packed.
+        const size_t sourceRowBytes = static_cast<size_t>(std::max(kHostFrameWidth, outWidth)) * 4u;
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
@@ -1707,6 +1729,10 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
     const GSContext &ctx = state.context;
     if (m_hasPreferredDisplaySource && ctx.frame.fbp == m_preferredDisplayDestFbp)
         m_hasPreferredDisplaySource = false;
+    // Which field the displayed buffer holds: games that draw one field per frame (interlaced FRAME mode) pick
+    // its lines by CSR.FIELD, and the odd field belongs one line lower on screen.
+    if (m_privRegs && (ctx.frame.fbp == (m_privRegs->dispfb1 & 0x1FFu) || ctx.frame.fbp == (m_privRegs->dispfb2 & 0x1FFu)))
+        m_displayWriteField = static_cast<int>((m_privRegs->csr.load(std::memory_order_acquire) >> 13u) & 1u);
     if (state.prim.type != GS_PRIM_SPRITE || batch.vertexCount < 2u)
         return;
 

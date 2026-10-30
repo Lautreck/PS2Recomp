@@ -131,6 +131,16 @@ namespace ps2recomp
                             }
 
                             const auto &valueField = patch.at("value");
+                            // switch = "<name>": both instructions are emitted and the runtime switch of that name
+                            // (PS2_SWITCH, e.g. a settings option) picks one each time it runs.
+                            if (patch.contains("switch") && patch.at("switch").is_string())
+                            {
+                                const uint32_t raw = valueField.is_string()
+                                                         ? static_cast<uint32_t>(std::stoul(toml::find<std::string>(patch, "value"), nullptr, 0))
+                                                         : static_cast<uint32_t>(toml::find<int64_t>(patch, "value"));
+                                config.switchPatches[address] = SwitchPatch{raw, toml::find<std::string>(patch, "switch")};
+                                continue;
+                            }
                             if (valueField.is_string())
                             {
                                 config.patches[address] = toml::find<std::string>(patch, "value");

@@ -383,6 +383,10 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
+    src/lib/ps2_input_latency.cpp
+    src/lib/ps2_hud.cpp
+    src/lib/ps2_graphics_settings.cpp
+    src/lib/ps2_switches.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
@@ -507,10 +511,61 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+# OpenGL GS renderer from the God of War native port (GPL-3.0), chosen at run time with PS2X_GS_BACKEND=gl
+# (default: the CPU renderer). Windows only: WGL context, x86 MXCSR handling in the backend thread.
+if(WIN32)
+    target_sources(ps2_runtime PRIVATE
+        src/lib/gs/gs_threaded_backend.cpp
+        src/lib/gs/gs_swizzle.cpp
+        src/lib/gs/gpu/gs_gl.cpp
+        src/lib/gs/gpu/gs_hw_backend.cpp
+        src/lib/gs/gpu/gs_texture_store.cpp)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_GS_GL=1)
+    target_link_libraries(ps2_runtime PRIVATE opengl32 gdi32)
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
 )
+
+# Native VU1 blocks (the God of War native port's lean backend, GPL-3.0): PS2X_VU1_MICROCODE_DIR is a local folder of
+# 16 KB VU1 micro memories captured with GOW_VU1_CAPTURA (GOW_VU1_NATIVE_OFF=1). tools/vu1/vu1n_gen.py turns them into
+# straight-line C++ blocks that VU1Interpreter::run() uses before the interpreter. Optional extra block heads go in
+# vu1n_heads.txt next to that folder. The micro memories and the generated C++ are game code: they stay in the
+# build folder and are never published. Empty: interpreter only.
+set(PS2X_VU1_MICROCODE_DIR "" CACHE PATH "Captured VU1 micro memories (empty: interpreter only)")
+get_filename_component(PS2X_VU1N_GEN_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/vu1/vu1n_gen.py" ABSOLUTE)
+set(PS2X_VU1N_GEN "${PS2X_VU1N_GEN_DEFAULT}" CACHE FILEPATH "Native VU1 block generator (vu1n_gen.py)")
+if(PS2X_VU1_MICROCODE_DIR AND NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
+    file(GLOB PS2X_VU1_IMAGES CONFIGURE_DEPENDS "${PS2X_VU1_MICROCODE_DIR}/*.bin")
+    find_package(Python3 COMPONENTS Interpreter)
+    if(PS2X_VU1_IMAGES AND Python3_FOUND AND EXISTS "${PS2X_VU1N_GEN}")
+        set(PS2X_VU1N_DIR "${CMAKE_CURRENT_BINARY_DIR}/vu1n_generated")
+        set(PS2X_VU1N_PARTS)
+        foreach(part RANGE 0 5)
+            list(APPEND PS2X_VU1N_PARTS "${PS2X_VU1N_DIR}/vu1n_part${part}.cpp")
+        endforeach()
+        get_filename_component(PS2X_VU1N_HEADS "${PS2X_VU1_MICROCODE_DIR}/../vu1n_heads.txt" ABSOLUTE)
+        set(PS2X_VU1N_HEADS_DEP)
+        if(EXISTS "${PS2X_VU1N_HEADS}")
+            set(PS2X_VU1N_HEADS_DEP "${PS2X_VU1N_HEADS}")
+        endif()
+        add_custom_command(OUTPUT ${PS2X_VU1N_PARTS}
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${PS2X_VU1N_DIR}"
+            COMMAND "${Python3_EXECUTABLE}" -I "${PS2X_VU1N_GEN}" "${PS2X_VU1N_DIR}" "${PS2X_VU1_MICROCODE_DIR}" --heads "${PS2X_VU1N_HEADS}" --parts 6
+            DEPENDS "${PS2X_VU1N_GEN}" ${PS2X_VU1_IMAGES} ${PS2X_VU1N_HEADS_DEP}
+            VERBATIM)
+        target_sources(ps2EntryRunner PRIVATE ${PS2X_VU1N_PARTS})
+        set_source_files_properties(${PS2X_VU1N_PARTS} PROPERTIES
+            SKIP_UNITY_BUILD_INCLUSION ON
+            SKIP_PRECOMPILE_HEADERS ON)
+        if(MSVC)
+            set_source_files_properties(${PS2X_VU1N_PARTS} PROPERTIES COMPILE_OPTIONS "/bigobj")
+        endif()
+        list(LENGTH PS2X_VU1_IMAGES PS2X_VU1_IMAGE_COUNT)
+        message(STATUS "Native VU1: ${PS2X_VU1_IMAGE_COUNT} micro memories in ${PS2X_VU1_MICROCODE_DIR}")
+    endif()
+endif()
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE

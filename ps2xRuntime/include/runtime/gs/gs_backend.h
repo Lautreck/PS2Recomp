@@ -24,6 +24,9 @@ public:
     virtual void Sync(GSSyncReason reason) = 0;
     virtual PresentationFrame Present(const GSPresentationRequest &request) = 0;
 
+    // GL backend (gs_hw_backend): true when Present publishes a shared GL texture instead of pixels.
+    virtual bool UsesSharedPresentation() const { return false; }
+
     virtual bool ClearFramebuffer(const GSContext &context, uint32_t rgba) = 0;
     virtual uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) = 0;
 

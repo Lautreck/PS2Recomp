@@ -41,6 +41,11 @@ namespace ps2x::iop::detail
         uint32_t waitMode = 0;
         uint32_t waitResultAddress = 0;
         int wakeupCount = 0;
+        // Intrusive queues. Identity is (priority, id) for ready and (wakeCycle, id) for delay.
+        IopThread *readyLink = nullptr;
+        IopThread *delayLink = nullptr;
+        bool queuedReady = false;
+        bool queuedDelay = false;
     };
 
     class IopKernel
@@ -67,6 +72,9 @@ namespace ps2x::iop::detail
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+        // Changes whenever a thread enters the ready queue (or on reset): an idle-skip cache sealed
+        // under an older value is stale.
+        [[nodiscard]] uint64_t schedEpoch() const noexcept { return m_schedEpoch; }
 
     private:
         struct Semaphore
@@ -90,6 +98,12 @@ namespace ps2x::iop::detail
         void wakeOneSemaphore(int id);
         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
         void wakeEventWaiters(EventFlag &event);
+        void assignState(IopThread &thread, IopThreadState state);
+        void insertReady(IopThread &thread);
+        void removeReady(IopThread &thread);
+        void insertDelay(IopThread &thread);
+        void removeDelay(IopThread &thread);
+        void promoteDueDelays(uint64_t currentCycle);
 
         IopMemory &m_memory;
         std::map<int, IopThread> m_threads;
@@ -99,5 +113,9 @@ namespace ps2x::iop::detail
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
         IopThread *m_currentThread = nullptr;
+        IopThread *m_readyHead = nullptr;
+        IopThread *m_delayHead = nullptr;
+        uint64_t m_nextDelayWake = ~uint64_t{0};
+        uint64_t m_schedEpoch = 0;
     };
 }

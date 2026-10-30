@@ -26,6 +26,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
         void runEeCycles(uint64_t eeCycles) noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+        [[nodiscard]] bool deliverUserSifCmd(uint32_t commandId, const void *packet, uint32_t packetSize);
         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
         void onSifTransfer(const SifTransfer &transfer);
 
@@ -37,6 +38,11 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
 
         [[nodiscard]] uint64_t cycles() const noexcept;
+        // When set, runCycles skips kernel entry while no ready thread can appear before a sealed cycle.
+        // Tests turn it off to lock the same wake cycle, and reseal to prove one invalidation.
+        void setIdleSkipCache(bool enabled) noexcept;
+        void testSealIdleSkip(uint64_t untilCycle) noexcept;
+        [[nodiscard]] uint64_t testIdleSkipCount() const noexcept;
         [[nodiscard]] uint64_t instructions() const noexcept;
         [[nodiscard]] uint32_t loadedModuleCount() const noexcept;
         [[nodiscard]] uint32_t threadCount() const noexcept;

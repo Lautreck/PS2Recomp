@@ -1,4 +1,6 @@
 #include "runtime/ps2_pad.h"
+#include "runtime/ps2_graphics_settings.h"
+#include "runtime/ps2_input_latency.h"
 #include "ps2_host_backend.h"
 #include <cstring>
 
@@ -7,22 +9,36 @@ namespace
     constexpr uint8_t kPadAnalogMarker = 0x73;
     constexpr uint8_t kPadStickCenter = 0x80;
 
-    constexpr uint16_t PAD_LEFT = 0x0080u;
-    constexpr uint16_t PAD_DOWN = 0x0040u;
-    constexpr uint16_t PAD_RIGHT = 0x0020u;
-    constexpr uint16_t PAD_UP = 0x0010u;
-    constexpr uint16_t PAD_START = 0x0008u;
-    constexpr uint16_t PAD_R3 = 0x0004u;
-    constexpr uint16_t PAD_L3 = 0x0002u;
-    constexpr uint16_t PAD_SELECT = 0x0001u;
-    constexpr uint16_t PAD_SQUARE = 0x8000u;
-    constexpr uint16_t PAD_CROSS = 0x4000u;
-    constexpr uint16_t PAD_CIRCLE = 0x2000u;
-    constexpr uint16_t PAD_TRIANGLE = 0x1000u;
-    constexpr uint16_t PAD_R1 = 0x0800u;
-    constexpr uint16_t PAD_L1 = 0x0400u;
-    constexpr uint16_t PAD_R2 = 0x0200u;
-    constexpr uint16_t PAD_L2 = 0x0100u;
+    // Port 0's historical byte: 128 + axis*127 (full left is 1, not 0).
+    uint8_t stickByte(float v)
+    {
+        if (v < -1.f)
+            v = -1.f;
+        else if (v > 1.f)
+            v = 1.f;
+        return static_cast<uint8_t>(128.f + v * 127.f);
+    }
+
+    bool g_triggerSignedL = false;
+    bool g_triggerSignedR = false;
+
+    void overlayKeySticks(const ps2_controls::Snap &snap, const ps2_controls::StickFloats &keySticks, bool active,
+                          ps2_controls::StickFloats &sticks)
+    {
+        if (!active)
+            return;
+        if (keySticks.lx != 0.f || keySticks.ly != 0.f)
+        {
+            sticks.lx = keySticks.lx;
+            sticks.ly = keySticks.ly;
+        }
+        if (keySticks.rx != 0.f || keySticks.ry != 0.f)
+        {
+            sticks.rx = keySticks.rx;
+            sticks.ry = keySticks.ry;
+        }
+        (void)snap;
+    }
 }
 
 bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
@@ -37,89 +53,79 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[3] = 0xFF;
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
-    uint16_t btns = 0xFFFFu;
-    constexpr int kGamepad = 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
-    auto clearBit = [&btns](uint16_t mask)
-    { btns &= ~mask; };
+    const ps2_controls::Snap *snap = ps2_controls::publishedSnap();
+    if (!snap)
+        return true;
 
-    if (useGamepad)
+    uint16_t pressed = 0;
+    ps2_controls::StickFloats sticks;
+    const bool blockButtons = ps2_input_latency::gamepadButtonsBlocked();
+    if (!snap->ignoreGamepads && IsGamepadAvailable(0))
     {
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
-            clearBit(PAD_UP);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
-            clearBit(PAD_DOWN);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
-            clearBit(PAD_LEFT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
-            clearBit(PAD_RIGHT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
-            clearBit(PAD_CROSS);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
-            clearBit(PAD_CIRCLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
-            clearBit(PAD_SQUARE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
-            clearBit(PAD_TRIANGLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
-            clearBit(PAD_L1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
-            clearBit(PAD_R1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
-            clearBit(PAD_L2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
-            clearBit(PAD_R2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
-            clearBit(PAD_START);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
-            clearBit(PAD_SELECT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
-            clearBit(PAD_L3);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
-            clearBit(PAD_R3);
-
-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
-        data[6] = static_cast<uint8_t>(128 + lx * 127);
-        data[7] = static_cast<uint8_t>(128 + ly * 127);
-        data[4] = static_cast<uint8_t>(128 + rx * 127);
-        data[5] = static_cast<uint8_t>(128 + ry * 127);
+        bool down[18] = {};
+        if (!blockButtons)
+        {
+            for (int b = 1; b <= 17; ++b)
+                down[b] = IsGamepadButtonDown(0, b);
+        }
+        float axes[6];
+        for (int a = 0; a < 6; ++a)
+            axes[a] = GetGamepadAxisMovement(0, a);
+        pressed = ps2_controls::mapGamepad(*snap, down, axes, g_triggerSignedL, g_triggerSignedR, sticks, !blockButtons);
     }
-    else
+    ps2_controls::swapSticksIf(*snap, sticks);
+
+    if (!ps2_input_latency::padPostingSuppressed())
     {
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-            clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-            clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
-            clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
-            clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-            clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
-            clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
-            clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
-            clearBit(PAD_START);
-        if (IsKeyDown(KEY_TAB))
-            clearBit(PAD_SELECT);
+        uint16_t hostKeys = 0;
+        float klx = 0.f, kly = 0.f, krx = 0.f, kry = 0.f;
+        bool keyStick = false;
+        if (ps2_input_latency::sampleKeyboard(hostKeys, &klx, &kly, &krx, &kry, &keyStick))
+        {
+            pressed = static_cast<uint16_t>(pressed | hostKeys);
+            ps2_controls::StickFloats fromKeys;
+            fromKeys.lx = klx;
+            fromKeys.ly = kly;
+            fromKeys.rx = krx;
+            fromKeys.ry = kry;
+            overlayKeySticks(*snap, fromKeys, keyStick, sticks);
+        }
+        else
+        {
+            for (int i = 0; i < snap->rlCount; ++i)
+            {
+                if (snap->rlKeys[i].key > 0 && IsKeyDown(snap->rlKeys[i].key))
+                    pressed = static_cast<uint16_t>(pressed | snap->rlKeys[i].mask);
+            }
+            ps2_controls::StickFloats fromKeys;
+            bool any = false;
+            for (int i = 0; i < snap->stickCount; ++i)
+            {
+                const ps2_controls::Snap::StickBind &bind = snap->sticks[i];
+                if (bind.key > 0 && IsKeyDown(bind.key))
+                {
+                    if (bind.stick == 0 && bind.axis == 0)
+                        fromKeys.lx += bind.value;
+                    else if (bind.stick == 0)
+                        fromKeys.ly += bind.value;
+                    else if (bind.axis == 0)
+                        fromKeys.rx += bind.value;
+                    else
+                        fromKeys.ry += bind.value;
+                    any = true;
+                }
+            }
+            overlayKeySticks(*snap, fromKeys, any, sticks);
+        }
     }
 
-    data[2] = static_cast<uint8_t>(btns & 0xFF);
-    data[3] = static_cast<uint8_t>(btns >> 8);
+    ps2_controls::invertAndDeadzone(*snap, sticks);
+    const uint16_t activeLow = static_cast<uint16_t>(~pressed);
+    data[2] = static_cast<uint8_t>(activeLow & 0xFF);
+    data[3] = static_cast<uint8_t>(activeLow >> 8);
+    data[6] = stickByte(sticks.lx);
+    data[7] = stickByte(sticks.ly);
+    data[4] = stickByte(sticks.rx);
+    data[5] = stickByte(sticks.ry);
     return true;
 }

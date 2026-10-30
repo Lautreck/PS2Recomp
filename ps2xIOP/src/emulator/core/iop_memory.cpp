@@ -1,6 +1,7 @@
 #include "iop_memory.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace ps2x::iop::detail
@@ -17,6 +18,11 @@ namespace ps2x::iop::detail
         {
             return (value + alignment - 1u) & ~(alignment - 1u);
         }
+
+        uint32_t alignDown(uint32_t value, uint32_t alignment)
+        {
+            return value & ~(alignment - 1u);
+        }
     }
 
     IopMemory::IopMemory()
@@ -32,7 +38,12 @@ namespace ps2x::iop::detail
         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
         m_hardware.clear();
         m_allocations.clear();
-        m_heapCursor = HeapBase;
+        // Process-wide only while the sound route is on. Tests and a normal boot leave
+        // the cursor at HeapBase and allocate bottom-up, which is the DMA test's window.
+        const char *sound = std::getenv("TEKKEN4_SOUND");
+        m_topDown = sound != nullptr && sound[0] == '1' && sound[1] == '\0';
+        m_heapFloor = m_topDown ? SoundHeapFloor : HeapBase;
+        m_heapCursor = m_topDown ? HeapLimit : HeapBase;
         m_interruptStatus = 0;
         m_interruptMask = 0;
         m_interruptControl = 1;
@@ -289,7 +300,7 @@ namespace ps2x::iop::detail
         if (fixed)
         {
             const uint32_t address = *fixed;
-            if (address < HeapBase || address + size > HeapLimit)
+            if (address < m_heapFloor || address + size > HeapLimit)
                 return 0u;
             for (const auto &block : m_allocations)
                 if (address < block.address + block.size && block.address < address + size)
@@ -299,28 +310,62 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+        if (!m_topDown)
+        {
+            uint32_t candidate = alignUp(m_heapCursor, alignment);
+            for (;;)
+            {
+                bool overlap = false;
+                for (const auto &block : m_allocations)
+                {
+                    if (candidate < block.address + block.size && block.address < candidate + size)
+                    {
+                        candidate = alignUp(block.address + block.size, alignment);
+                        overlap = true;
+                        break;
+                    }
+                }
+                if (!overlap)
+                    break;
+            }
+            if (candidate > HeapLimit || size > HeapLimit - candidate)
+                return 0u;
+            m_allocations.push_back({candidate, size});
+            markOwned(candidate, size);
+            m_heapCursor = std::max(m_heapCursor, candidate + size);
+            return candidate;
+        }
+
+        // Top-down bump, sound route only. [m_heapFloor, m_heapCursor) is free.
+        // AllocSysMemory(0xE9400) is placed under earlier blocks and stays at or above SoundHeapFloor.
+        uint32_t limit = m_heapCursor;
         for (;;)
         {
+            if (limit <= m_heapFloor || size > limit - m_heapFloor)
+                return 0u;
+            const uint32_t candidate = alignDown(limit - size, alignment);
+            if (candidate < m_heapFloor)
+                return 0u;
             bool overlap = false;
             for (const auto &block : m_allocations)
             {
                 if (candidate < block.address + block.size && block.address < candidate + size)
                 {
-                    candidate = alignUp(block.address + block.size, alignment);
+                    if (block.address >= limit)
+                        return 0u;
+                    limit = block.address;
                     overlap = true;
                     break;
                 }
             }
             if (!overlap)
-                break;
+            {
+                m_allocations.push_back({candidate, size});
+                markOwned(candidate, size);
+                m_heapCursor = candidate;
+                return candidate;
+            }
         }
-        if (candidate > HeapLimit || size > HeapLimit - candidate)
-            return 0u;
-        m_allocations.push_back({candidate, size});
-        markOwned(candidate, size);
-        m_heapCursor = std::max(m_heapCursor, candidate + size);
-        return candidate;
     }
 
     bool IopMemory::freeAllocation(uint32_t address)
@@ -339,6 +384,8 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::maxFreeMemory() const
     {
+        if (m_topDown)
+            return m_heapCursor > m_heapFloor ? m_heapCursor - m_heapFloor : 0u;
         return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
     }
 
@@ -369,3 +416,37 @@ namespace ps2x::iop::detail
         return result;
     }
 }
+
+#ifdef PS2X_IOP_HEAP_DIRECTION_TEST
+// Standalone: default heap stays bottom-up at HeapBase; TEKKEN4_SOUND=1 bumps down from HeapLimit
+// so AllocSysMemory(0xE9400) still fits above SoundHeapFloor. Not linked into the library.
+int main()
+{
+    using ps2x::iop::detail::IopMemory;
+    _putenv_s("TEKKEN4_SOUND", "");
+    IopMemory bottom;
+    const uint32_t first = bottom.allocate(0x880u, 64u);
+    const uint32_t second = bottom.allocate(0x100u, 64u);
+    const uint32_t big = bottom.allocate(0xE9400u, 16u);
+    if (first != IopMemory::HeapBase || second != IopMemory::HeapBase + 0x880u || big != 0u)
+    {
+        std::fprintf(stderr, "bottom-up first=%08x second=%08x big=%08x\n", first, second, big);
+        return 1;
+    }
+    _putenv_s("TEKKEN4_SOUND", "1");
+    IopMemory top;
+    const uint32_t topFirst = top.allocate(0x880u, 64u);
+    const uint32_t topBig = top.allocate(0xE9400u, 16u);
+    if (topFirst != 0x001EF780u || topBig < IopMemory::SoundHeapFloor || topBig + 0xE9400u != topFirst)
+    {
+        std::fprintf(stderr, "top-down first=%08x big=%08x\n", topFirst, topBig);
+        return 2;
+    }
+    _putenv_s("TEKKEN4_SOUND", "");
+    IopMemory again;
+    if (again.allocate(0x10u, 16u) != IopMemory::HeapBase)
+        return 3;
+    std::printf("heap-direction ok bottom=%08x top=%08x big=%08x\n", first, topFirst, topBig);
+    return 0;
+}
+#endif

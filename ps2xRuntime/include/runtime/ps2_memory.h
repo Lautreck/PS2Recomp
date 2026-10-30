@@ -312,6 +312,10 @@ public:
     uint32_t advanceEeTimers(uint64_t eeCycles) noexcept;
     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
     void resetEeTimers() noexcept;
+    // Applies eeCycles to the four EE timers. Same tick math as a direct advanceEeTimers call.
+    uint32_t applyEeTimerTicks(uint64_t eeCycles) noexcept;
+    // Guest timer reads and writes must see counts from every checkpoint, including ones that were batched.
+    void flushEeTimerDebt() noexcept;
 
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
@@ -343,6 +347,8 @@ public:
     void processVIF0Data(const uint8_t *data, uint32_t sizeBytes);
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
+    void forwardPath2Payload(const uint8_t *payload, uint32_t bytes, bool directHl);
+    void continuePath2Packet(const uint8_t *data, uint32_t sizeBytes, bool directHl);
     void processPendingTransfers();
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
@@ -407,8 +413,16 @@ public:
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
     bool m_path3Masked = false;
-    uint32_t m_vif1PendingPath2ImageQwc = 0u;
-    bool m_vif1PendingPath2DirectHl = false;
+    // PATH2 GIF packet cut off at the end of a DIRECT: it continues in the next DIRECT (an IMAGE also in raw
+    // qwords of the VIF stream).
+    uint64_t m_path2CutTagLo = 0u;
+    uint64_t m_path2CutTagHi = 0u;
+    uint32_t m_path2CutDoneRegs = 0u; // PACKED/REGLIST registers of the cut packet already sent
+    uint32_t m_path2CutRemainingBytes = 0u;
+    bool m_path2CutDirectHl = false;
+    // A VIF1 command whose payload runs past the end of a DMA transfer (e.g. an UNPACK in a CNT tag with its data in
+    // the following REF tag): its bytes from the VIFcode on, parsed again with the next transfer's data appended.
+    std::vector<uint8_t> m_vif1Carry;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer
@@ -449,9 +463,31 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    // Checkpoints smaller than the next compare/overflow are summed and applied in one tick update.
+    // A timer read or write flushes first, so the guest sees the same count. An IRQ discovered on that
+    // flush is latched and returned by the next advanceEeTimers (one checkpoint later).
+    uint64_t m_eeTimerDebt = 0;
+    uint64_t m_eeTimerLimit = 1;
+    uint32_t m_latchedTimerIrq = 0;
+    bool m_gifFqcPending = false;
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+    bool processSprToChain(uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);
+
+    // MFIFO (D_CTRL.MFD = 2 VIF1, 3 GIF): fromSPR writes into the ring RBOR + (addr & RBSR) and the drain
+    // channel, started in chain mode, consumes tags from the ring as they arrive instead of all at once.
+    uint32_t mfifoDrainChannel();
+    uint32_t mfifoWrap(uint32_t address);
+    // Qwords that stay contiguous in both the MFIFO ring and the RAM mirror. 1 when the ring is not a plain mask.
+    uint32_t mfifoContigQwords(uint32_t addr);
+    void drainMfifo();
+    bool m_mfifoDraining = false;
+    // The MFIFO drain channel while it waits for the ring to fill (STR set, no END / REFE reached yet). Transfers
+    // otherwise finish synchronously, so this is the only DMA channel that can be running when the EE writes CHCR.
+    uint32_t m_mfifoWaitingChannel = 0u;
+    // Reused across drains. clear() keeps the capacity so a fight does not reallocate the VIF packet.
+    std::vector<uint8_t> m_mfifoPacket;
 };
 
 #endif // PS2_MEMORY_H

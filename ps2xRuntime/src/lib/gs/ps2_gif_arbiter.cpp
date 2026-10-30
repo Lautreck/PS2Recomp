@@ -1,6 +1,54 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+namespace
+{
+// TEKKEN4_GT_STATS=1. Counts only; the GS still sees the same bytes.
+struct GifCopyStats
+{
+    bool on = false;
+    uint64_t submits = 0;
+    uint64_t immediate = 0;
+    uint64_t copied = 0;
+    uint64_t bytes = 0;
+
+    GifCopyStats()
+    {
+        const char *env = std::getenv("TEKKEN4_GT_STATS");
+        on = env != nullptr && env[0] != '\0' && env[0] != '0';
+    }
+
+    void note(bool direct, uint32_t sizeBytes)
+    {
+        if (!on)
+            return;
+        ++submits;
+        bytes += sizeBytes;
+        if (direct)
+            ++immediate;
+        else
+            ++copied;
+        if ((submits & 0x3FFFu) == 0u)
+            dump("snap");
+    }
+
+    void dump(const char *tag) const
+    {
+        if (!on)
+            return;
+        std::fprintf(stderr, "[gt-stats] gif %s submits=%llu immediate=%llu copied=%llu bytes=%llu\n", tag,
+                     static_cast<unsigned long long>(submits), static_cast<unsigned long long>(immediate),
+                     static_cast<unsigned long long>(copied), static_cast<unsigned long long>(bytes));
+    }
+
+    ~GifCopyStats() { dump("final"); }
+};
+
+GifCopyStats g_gifCopyStats;
+} // namespace
 
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
@@ -18,10 +66,18 @@ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
     return flg == 2u;
 }
 
-void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
+void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl,
+                       bool drainImmediately)
 {
     if (!data || sizeBytes < 16 || !m_processFn)
         return;
+
+    if (drainImmediately && m_queue.empty())
+    {
+        m_processFn(data, sizeBytes);
+        g_gifCopyStats.note(true, sizeBytes);
+        return;
+    }
 
     GifArbiterPacket pkt;
     pkt.pathId = pathId;
@@ -30,6 +86,7 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.data.resize(sizeBytes);
     std::memcpy(pkt.data.data(), data, sizeBytes);
     m_queue.push_back(std::move(pkt));
+    g_gifCopyStats.note(false, sizeBytes);
 }
 
 void GifArbiter::drain()

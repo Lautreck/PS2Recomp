@@ -9,9 +9,11 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -61,6 +63,12 @@ namespace ps2x::iop::detail
         {
             for (uint32_t i = 0u; i < 4u; ++i)
                 destination[i] = static_cast<uint8_t>(value >> (i * 8u));
+        }
+
+        uint32_t readLe32(const uint8_t *source)
+        {
+            return static_cast<uint32_t>(source[0]) | (static_cast<uint32_t>(source[1]) << 8u) |
+                   (static_cast<uint32_t>(source[2]) << 16u) | (static_cast<uint32_t>(source[3]) << 24u);
         }
 
         void writeBe32(uint8_t *destination, uint32_t value)
@@ -338,6 +346,17 @@ namespace ps2x::iop::detail
                 }
             }
 
+            case 24: // sceCdReadClock. zsiopdrv asks; a fixed clock is enough.
+                if (host.hostPath(HostPathKind::CdImage).empty())
+                    return false;
+                if (a0 != 0u)
+                {
+                    const uint8_t clock[8] = {0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01, 0x24};
+                    (void)memory.writeRam(a0, clock, sizeof(clock));
+                }
+                cpu.gpr[2] = a0 != 0u ? 1u : 0u;
+                return true;
+
             case 75: // sceCdMmode
                 mediaMode = a0;
                 cpu.gpr[2] = 1u;
@@ -594,12 +613,106 @@ namespace ps2x::iop::detail
             return &nodes[current];
         }
 
+        // sceCdSearchFile on the disc image: walks its ISO9660 directories from the primary volume descriptor
+        // (sector 16), as cdvdman does on a real disc. Fills sceCdlFILE lsn, size and name[16] (date left 0).
+        // Tekken 4's sound driver looks up \TEKKEN\DATA2.BIN (the music) at init and turns streaming off when
+        // the lookup fails.
+        bool searchImage(std::string_view guestPath, std::array<uint8_t, 32u> &hit)
+        {
+            if (imageHandle == 0u)
+                imageHandle = host.openHostFile(host.hostPath(HostPathKind::CdImage));
+            if (imageHandle == 0u)
+                return false;
+            auto readImage = [&](uint32_t lsn, uint8_t *destination, size_t size)
+            {
+                size_t bytesRead = 0u;
+                return host.readHostFile(imageHandle, static_cast<uint64_t>(lsn) * kSectorSize, destination, size,
+                                         bytesRead) &&
+                       bytesRead == size;
+            };
+            std::array<uint8_t, kSectorSize> pvd{};
+            if (!readImage(16u, pvd.data(), pvd.size()) || pvd[0] != 1u || std::memcmp(pvd.data() + 1u, "CD001", 5u) != 0)
+                return false;
+            constexpr size_t kRootRecord = 156u;
+            uint32_t dirLsn = readLe32(pvd.data() + kRootRecord + 2u);
+            uint32_t dirSize = readLe32(pvd.data() + kRootRecord + 10u);
+
+            if (const size_t colon = guestPath.find(':'); colon != std::string_view::npos)
+                guestPath.remove_prefix(colon + 1u); // "cdrom0:\..."
+            size_t begin = 0u;
+            while (begin < guestPath.size())
+            {
+                const size_t end = guestPath.find_first_of("\\/", begin);
+                const std::string_view component =
+                    guestPath.substr(begin, end == std::string_view::npos ? std::string_view::npos : end - begin);
+                begin = end == std::string_view::npos ? guestPath.size() : end + 1u;
+                if (component.empty())
+                    continue;
+                const bool last = guestPath.find_first_not_of("\\/", begin) == std::string_view::npos;
+                if (dirSize == 0u || dirSize > 64u * kSectorSize)
+                    return false;
+                std::vector<uint8_t> dir((dirSize + kSectorSize - 1u) / kSectorSize * kSectorSize);
+                if (!readImage(dirLsn, dir.data(), dir.size()))
+                    return false;
+                const std::string wanted = normalizedIsoComponent(component);
+                bool matched = false;
+                for (size_t at = 0u; at + 33u <= dir.size();)
+                {
+                    const uint8_t length = dir[at];
+                    if (length == 0u)
+                    {
+                        at = (at / kSectorSize + 1u) * kSectorSize; // records do not cross sectors
+                        continue;
+                    }
+                    const uint8_t *record = dir.data() + at;
+                    const uint8_t nameLength = record[32];
+                    at += length;
+                    if (length < 33u + nameLength)
+                        continue;
+                    const std::string_view name(reinterpret_cast<const char *>(record + 33), nameLength);
+                    if (normalizedIsoComponent(name) != wanted)
+                        continue;
+                    const bool directory = (record[25] & 2u) != 0u;
+                    if (last == directory)
+                        continue;
+                    dirLsn = readLe32(record + 2);
+                    dirSize = readLe32(record + 10);
+                    if (last)
+                    {
+                        hit.fill(0u);
+                        writeLe32(hit.data(), dirLsn);
+                        writeLe32(hit.data() + 4u, dirSize);
+                        std::memcpy(hit.data() + 8u, name.data(), std::min<size_t>(16u, name.size()));
+                        return true;
+                    }
+                    matched = true;
+                    break;
+                }
+                if (!matched)
+                    return false;
+            }
+            return false;
+        }
+
         bool searchFile(uint32_t resultAddress, uint32_t nameAddress)
         {
             if (resultAddress == 0u || nameAddress == 0u)
                 return false;
 
             const std::string guestPath = memory.readString(nameAddress, 1024u);
+            if (!host.hostPath(HostPathKind::CdImage).empty())
+            {
+                std::array<uint8_t, 32u> hit{};
+                const bool found = searchImage(guestPath, hit);
+                std::ostringstream out;
+                out << "[cdvd] sceCdSearchFile " << guestPath;
+                if (found)
+                    out << " -> LBN " << readLe32(hit.data()) << " size " << readLe32(hit.data() + 4u);
+                else
+                    out << " not on the disc image";
+                host.log(found ? LogLevel::Info : LogLevel::Warning, out.str());
+                return found && memory.writeRam(resultAddress, hit.data(), hit.size());
+            }
             IsoNode *node = findVirtualIsoNode(guestPath);
             if (!node)
                 return false;
@@ -661,6 +774,14 @@ namespace ps2x::iop::detail
             const uint64_t byteCount64 = static_cast<uint64_t>(sectors) * kSectorSize;
             if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
             {
+                // Always logged: a rejected read is silent to the driver (v0=0, no callback) and later
+                // banks then never reach the SPU. The success log below stays capped.
+                const bool owned = destination < IopMemory::RamSize &&
+                                   memory.ownsRamRange(destination, static_cast<size_t>(std::min<uint64_t>(byteCount64, 1u)));
+                std::ostringstream out;
+                out << "[cdvd] sceCdRead FAIL lsn=" << lsn << " sectors=" << sectors << " dst=0x" << std::hex
+                    << destination << std::dec << " bytes=" << byteCount64 << (owned ? " span-unowned" : " dst-unowned");
+                host.log(LogLevel::Warning, out.str());
                 lastError = kCdvdErrorRead;
                 return false;
             }
@@ -682,6 +803,26 @@ namespace ps2x::iop::detail
                                              byteCount,
                                              bytesRead) &&
                            bytesRead == byteCount;
+                }
+            }
+
+            if (!imagePath.empty())
+            {
+                static int logged = 0;
+                // Failures are not capped: a later bank read (character select) was invisible once six
+                // boot reads had been printed. Successes stay at six unless TEKKEN4_SOUND_TRACE=1.
+                static const bool trace = [] {
+                    const char *value = std::getenv("TEKKEN4_SOUND_TRACE");
+                    return value != nullptr && value[0] == '1' && value[1] == '\0';
+                }();
+                if (!read || trace || logged < 6)
+                {
+                    if (read && !trace)
+                        ++logged;
+                    std::ostringstream out;
+                    out << "[cdvd] sceCdRead lsn=" << lsn << " sectors=" << sectors << " dst=0x" << std::hex
+                        << destination << std::dec << (read ? " ok" : " FAIL");
+                    host.log(read ? LogLevel::Info : LogLevel::Warning, out.str());
                 }
             }
 

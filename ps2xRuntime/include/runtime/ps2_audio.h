@@ -46,4 +46,10 @@ private:
     void pruneFinishedSounds();
 };
 
+// Extra stereo frames mixed onto the IOP output before the WAV and the device.
+// Tekken's movie HLE keeps the video and pushes the interleaved SPU ADPCM here.
+// No effect when TEKKEN4_SOUND is off (nothing is queued, the mixer is not running).
+void ps2PushMoviePcm(const int16_t *stereoInterleaved, size_t frames);
+void ps2ClearMoviePcm();
+
 #endif

@@ -9,6 +9,11 @@ namespace ps2_stubs
     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);
     void notifyMpegCdStreamEof(PS2Runtime *runtime = nullptr);
+    // Decodes one IPU intra picture, as games keep compressed images for the IPU's IDEC command: the IPU_CTRL flags
+    // byte, the macroblocks, then the end code 00 00 01 B0 (FFmpeg's "ipu" format). Writes the IPU's RGB32 output:
+    // macroblocks in raster order, each 16x16 pixels (1024 bytes), colour-converted like the IPU, alpha 0x80.
+    // Returns false when the picture does not decode or the runtime has no FFmpeg.
+    bool decodeIpuIntraPicture(const uint8_t *data, size_t size, uint32_t mbWidth, uint32_t mbHeight, uint8_t *rgba32Out);
     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

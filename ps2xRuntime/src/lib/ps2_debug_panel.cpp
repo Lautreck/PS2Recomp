@@ -3,6 +3,8 @@
 #include "ps2_runtime_macros.h"
 #include "ps2_log.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_graphics_settings.h"
+#include "runtime/ps2_input_latency.h"
 
 #include <unordered_set>
 #include "Kernel/Syscalls/Helpers/State.h"
@@ -20,6 +22,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -2174,6 +2177,316 @@ namespace
         }
     }
 
+    // Rebind capture. A click arms the row; the next draw skips one frame so a
+    // stale GetKeyPressed / gamepad edge is not consumed. Esc cancels.
+    int g_rebindButton = -1;
+    int g_rebindArm = 0;
+    bool g_rebindAdd = false;
+    bool g_gateApplied = false;
+
+    void cancelControlsCapture()
+    {
+        g_rebindButton = -1;
+        g_rebindArm = 0;
+        g_rebindAdd = false;
+    }
+
+    void controlsInputGate()
+    {
+        const bool capture = g_rebindButton >= 0;
+        const bool text = ImGui::GetIO().WantTextInput;
+        ps2_input_latency::setPadPostingSuppressed(capture || text);
+        ps2_input_latency::setGamepadButtonsBlocked(capture);
+        g_gateApplied = true;
+    }
+
+    void controlsInputGateClear()
+    {
+        if (!g_gateApplied && g_rebindButton < 0)
+            return;
+        cancelControlsCapture();
+        ps2_input_latency::setPadPostingSuppressed(false);
+        ps2_input_latency::setGamepadButtonsBlocked(false);
+        g_gateApplied = false;
+    }
+
+    void formatBinding(const ps2_controls::Controls &controls, int button, char *dst, int cap)
+    {
+        if (g_rebindButton == button)
+        {
+            std::snprintf(dst, static_cast<std::size_t>(cap), "Press a button or key (Esc cancels)");
+            return;
+        }
+        char gp[80];
+        char keys[96];
+        gp[0] = '\0';
+        keys[0] = '\0';
+        int used = 0;
+        for (int i = 0; i < controls.gpCount[button] && i < ps2_controls::kMaxSources; ++i)
+        {
+            const char *name = ps2_controls::sourceName(controls.gp[button][i]);
+            if (!name)
+                continue;
+            const int n = std::snprintf(gp + used, sizeof(gp) - static_cast<std::size_t>(used), "%s%s", used ? "," : "", name);
+            if (n < 0 || used + n >= static_cast<int>(sizeof(gp)))
+                break;
+            used += n;
+        }
+        used = 0;
+        for (int i = 0; i < controls.keyCount[button] && i < ps2_controls::kMaxKeys; ++i)
+        {
+            const char *name = ps2_controls::keyName(controls.keys[button][i]);
+            if (!name)
+                continue;
+            const int n = std::snprintf(keys + used, sizeof(keys) - static_cast<std::size_t>(used), "%s%s", used ? "," : "", name);
+            if (n < 0 || used + n >= static_cast<int>(sizeof(keys)))
+                break;
+            used += n;
+        }
+        if (gp[0] && keys[0])
+            std::snprintf(dst, static_cast<std::size_t>(cap), "%s | %s", gp, keys);
+        else if (gp[0])
+            std::snprintf(dst, static_cast<std::size_t>(cap), "%s", gp);
+        else if (keys[0])
+            std::snprintf(dst, static_cast<std::size_t>(cap), "%s", keys);
+        else
+            std::snprintf(dst, static_cast<std::size_t>(cap), "(empty)");
+    }
+
+    bool pollRebind(ps2_controls::Controls &controls)
+    {
+        if (g_rebindButton < 0 || g_rebindButton >= ps2_controls::kButtonCount)
+            return false;
+        if (g_rebindArm > 0)
+        {
+            --g_rebindArm;
+            while (GetKeyPressed() != 0)
+            {
+            }
+            return false;
+        }
+        int key = 0;
+        for (;;)
+        {
+            const int next = GetKeyPressed();
+            if (next == 0)
+                break;
+            if (next == KEY_ESCAPE)
+            {
+                while (GetKeyPressed() != 0)
+                {
+                }
+                cancelControlsCapture();
+                return false;
+            }
+            if (key == 0)
+                key = next;
+        }
+        if (key == 0)
+        {
+            for (int i = 0; i < ps2_controls::catalogKeyCount(); ++i)
+            {
+                const int code = ps2_controls::catalogKeyRaylib(i);
+                if (code > 0 && IsKeyPressed(code))
+                {
+                    key = code;
+                    break;
+                }
+            }
+        }
+        if (key == KEY_ESCAPE)
+        {
+            cancelControlsCapture();
+            return false;
+        }
+        if (key != 0 && ps2_controls::keyName(key))
+        {
+            const int button = g_rebindButton;
+            if (!g_rebindAdd)
+            {
+                controls.keyCount[button] = 0;
+                for (int i = 0; i < ps2_controls::kMaxKeys; ++i)
+                    controls.keys[button][i] = 0;
+            }
+            bool exists = false;
+            for (int i = 0; i < controls.keyCount[button]; ++i)
+            {
+                if (controls.keys[button][i] == key)
+                    exists = true;
+            }
+            if (!exists && controls.keyCount[button] < ps2_controls::kMaxKeys)
+                controls.keys[button][controls.keyCount[button]++] = key;
+            cancelControlsCapture();
+            return true;
+        }
+
+        int src = 0;
+        static bool sigL[4] = {};
+        static bool sigR[4] = {};
+        for (int pad = 0; pad < 4 && src == 0; ++pad)
+        {
+            if (!IsGamepadAvailable(pad))
+                continue;
+            for (int btn = 1; btn <= 17; ++btn)
+            {
+                if (IsGamepadButtonPressed(pad, btn))
+                {
+                    src = btn;
+                    break;
+                }
+            }
+            if (src != 0)
+                break;
+            const float left = GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_TRIGGER);
+            const float right = GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_TRIGGER);
+            if (ps2_controls::triggerAmount(left, sigL[pad]) >= 0.55f)
+                src = ps2_controls::kSrcAxisLeft;
+            else if (ps2_controls::triggerAmount(right, sigR[pad]) >= 0.55f)
+                src = ps2_controls::kSrcAxisRight;
+        }
+        if (src != 0)
+        {
+            const int button = g_rebindButton;
+            controls.gpCount[button] = 1;
+            controls.gp[button][0] = src;
+            for (int s = 1; s < ps2_controls::kMaxSources; ++s)
+                controls.gp[button][s] = ps2_controls::kSrcEmpty;
+            cancelControlsCapture();
+            return true;
+        }
+        return false;
+    }
+
+    // F2: the player's settings (ps2_graphics_settings.h). Changes apply on the next frame and are saved at once.
+    void drawSettingsWindow(bool &open)
+    {
+        ImGui::SetNextWindowPos(ImVec2(8.0f, 8.0f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Settings (F2)", &open, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ps2_graphics::Settings settings = ps2_graphics::get();
+            bool changed = false;
+            if (pollRebind(settings.controls))
+                changed = true;
+
+            ImGui::SeparatorText("Controls");
+            static const char *const kLayouts[] = {"PlayStation (position)", "Xbox (position)", "Switch (position)",
+                                                   "Nintendo labels", "Keyboard"};
+            int layout = static_cast<int>(settings.controls.layout);
+            if (layout < 0 || layout >= IM_ARRAYSIZE(kLayouts))
+                layout = 0;
+            if (ImGui::Combo("Preset", &layout, kLayouts, IM_ARRAYSIZE(kLayouts)))
+            {
+                ps2_controls::applyLayout(settings.controls, static_cast<ps2_controls::Layout>(layout));
+                changed = true;
+            }
+            ImGui::TextDisabled("Click a row, then a gamepad button or key. Right-click adds a key. x clears keys.");
+            ImGui::BeginChild("controls-binds", ImVec2(420.0f, 200.0f), true);
+            for (int b = 0; b < ps2_controls::kButtonCount; ++b)
+            {
+                ImGui::PushID(b);
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(ps2_controls::buttonName(b));
+                ImGui::SameLine(72.0f);
+                char label[160];
+                formatBinding(settings.controls, b, label, static_cast<int>(sizeof(label)));
+                if (ImGui::Button(label, ImVec2(300.0f, 0.0f)))
+                {
+                    g_rebindButton = b;
+                    g_rebindArm = 1;
+                    g_rebindAdd = false;
+                }
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right))
+                {
+                    g_rebindButton = b;
+                    g_rebindArm = 1;
+                    g_rebindAdd = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x"))
+                {
+                    settings.controls.keyCount[b] = 0;
+                    for (int k = 0; k < ps2_controls::kMaxKeys; ++k)
+                        settings.controls.keys[b][k] = 0;
+                    if (g_rebindButton == b)
+                        cancelControlsCapture();
+                    changed = true;
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+            changed |= ImGui::SliderFloat("Deadzone left", &settings.controls.deadzoneLeft, 0.0f, 0.9f, "%.2f");
+            changed |= ImGui::SliderFloat("Deadzone right", &settings.controls.deadzoneRight, 0.0f, 0.9f, "%.2f");
+            float trigger = settings.controls.triggerThreshold > 0.0f ? settings.controls.triggerThreshold : 0.0f;
+            if (ImGui::SliderFloat("Trigger threshold (0 = buttons)", &trigger, 0.0f, 1.0f, "%.2f"))
+            {
+                settings.controls.triggerThreshold = trigger > 0.0f ? trigger : -1.0f;
+                changed = true;
+            }
+            bool invertRight = settings.controls.invertRight;
+            if (ImGui::Checkbox("Invert Y (right stick)", &invertRight))
+            {
+                settings.controls.invertRight = invertRight;
+                changed = true;
+            }
+            changed |= ImGui::Checkbox("Swap sticks", &settings.controls.stickSwap);
+            if (ImGui::Button("Reset controls to defaults"))
+            {
+                settings.controls = ps2_controls::defaultControls();
+                cancelControlsCapture();
+                changed = true;
+            }
+            ImGui::SeparatorText("Screen");
+            if (ImGui::Checkbox("Widescreen 16:9 (game patch by nemesis2000)", &settings.widescreen))
+            {
+                if (settings.widescreen)
+                    settings.aspect = ps2_graphics::Aspect::Ratio16x9;
+                else if (settings.aspect == ps2_graphics::Aspect::Ratio16x9)
+                    settings.aspect = ps2_graphics::Aspect::Ratio4x3;
+                changed = true;
+            }
+            static const char *const kAspects[] = {"4:3", "16:9", "Stretch to window",
+                                                   "Frame pixels (640x448, old default)"};
+            int aspect = static_cast<int>(settings.aspect);
+            if (ImGui::Combo("Aspect ratio", &aspect, kAspects, IM_ARRAYSIZE(kAspects)))
+            {
+                settings.aspect = static_cast<ps2_graphics::Aspect>(aspect);
+                changed = true;
+            }
+            if (settings.aspect == ps2_graphics::Aspect::Ratio16x9 && !settings.widescreen)
+                ImGui::TextDisabled("16:9 without the widescreen patch stretches the picture.");
+            changed |= ImGui::Checkbox("Smooth scaling to the window (bilinear)", &settings.smoothScreen);
+            ImGui::SeparatorText("Rendering (GL renderer)");
+            static const char *const kScales[] = {"1x (PS2: 640x448)", "2x (1280x896)", "3x (1920x1344)",
+                                                  "4x (2560x1792)"};
+            int scaleIndex = std::clamp(settings.internalScale, 1, ps2_graphics::kMaxInternalScale) - 1;
+            if (ImGui::Combo("Internal resolution", &scaleIndex, kScales, IM_ARRAYSIZE(kScales)))
+            {
+                settings.internalScale = scaleIndex + 1;
+                changed = true;
+            }
+            static const char *const kFilters[] = {"As the game (PS2 look)", "Bilinear (3D, sprites as the game)"};
+            int filter = static_cast<int>(settings.textureFilter);
+            if (ImGui::Combo("Texture filtering", &filter, kFilters, IM_ARRAYSIZE(kFilters)))
+            {
+                settings.textureFilter = static_cast<ps2_graphics::TextureFilter>(filter);
+                changed = true;
+            }
+            ImGui::SeparatorText("Post-processing");
+            changed |= ImGui::Checkbox("Anti-aliasing (FXAA)", &settings.fxaa);
+            changed |= ImGui::SliderInt("Sharpening", &settings.sharpen, 0, 100, "%d %%");
+            if (changed)
+                ps2_graphics::set(settings);
+            ImGui::Spacing();
+            ImGui::TextDisabled("Tip: 2x-4x internal resolution also smooths edges (supersampling).");
+            const char *path = std::getenv("PS2X_SETTINGS");
+            if (path && path[0])
+                ImGui::TextDisabled("Saved to %s", path);
+            else
+                ImGui::TextDisabled("Not saved: PS2X_SETTINGS is not set.");
+        }
+        ImGui::End();
+    }
+
 #endif
 }
 void PS2DebugPanel::initialize()
@@ -2183,6 +2496,14 @@ void PS2DebugPanel::initialize()
     {
         rlImGuiSetup(true);
         m_initialized = true;
+        // The debugger stays hidden until F1 (it covered the game at start); PS2X_DEBUG_PANEL=1 shows it at start,
+        // =0 turns it off (F1 ignored: test runs whose launcher presses F1, host screenshots).
+        // PS2X_SETTINGS_OPEN=1 opens the F2 settings window at start (screenshots of it in test runs).
+        const char *panel = std::getenv("PS2X_DEBUG_PANEL");
+        m_visible = panel && panel[0] == '1';
+        m_debuggerOff = panel && panel[0] == '0';
+        const char *open = std::getenv("PS2X_SETTINGS_OPEN");
+        m_settingsVisible = open && open[0] == '1';
     }
 #endif
 }
@@ -2206,17 +2527,37 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-    if (IsKeyPressed(KEY_F1))
+    if (IsKeyPressed(KEY_F1) && !m_debuggerOff)
     {
         toggleVisible();
     }
-
-    if (!m_visible)
+    if (IsKeyPressed(KEY_F2))
     {
+        m_settingsVisible = !m_settingsVisible;
+    }
+
+    if (!m_visible && !m_settingsVisible)
+    {
+        controlsInputGateClear();
         return;
     }
 
     rlImGuiBegin();
+
+    if (m_settingsVisible)
+    {
+        drawSettingsWindow(m_settingsVisible);
+    }
+    if (!m_settingsVisible)
+    {
+        cancelControlsCapture();
+    }
+    if (!m_visible)
+    {
+        controlsInputGate();
+        rlImGuiEnd();
+        return;
+    }
 
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
@@ -2303,6 +2644,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     }
     ImGui::End();
 
+    controlsInputGate();
     rlImGuiEnd();
 #else
     (void)runtime;

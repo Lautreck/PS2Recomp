@@ -288,6 +288,9 @@ struct GSPresentationRequest
     GSFrameReg preferredSource{};
     uint32_t preferredDestFbp = 0;
     bool hasPreferredSource = false;
+    int displayField = -1; // CSR.FIELD when the displayed buffer was last drawn into, -1 = not yet
+    // GL backend: explicit captures read pixels back even in shared-texture mode.
+    bool forceReadback = false;
 };
 
 struct PresentationFrame

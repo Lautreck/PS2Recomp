@@ -11,6 +11,10 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#include "rlgl.h"
+#include "runtime/ps2_input_latency.h"
+#include "runtime/ps2_hud.h"
+#include "runtime/ps2_graphics_settings.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
@@ -19,6 +23,7 @@
 #include <fstream>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <chrono>
@@ -46,8 +51,9 @@ static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x
 static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
 #else
+// 4:3, the default display aspect (ps2_graphics_settings.h), so the picture fills the first window.
 static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
-static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
+static constexpr int HOST_WINDOW_HEIGHT = FB_WIDTH * 3 / 4;
 #endif
 struct ElfHeader
 {
@@ -388,8 +394,11 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+    // Fallback guest fps (no game override reports its frames): a new presented vsync tick.
+    ps2_hud::onHostPresent(needsLatch);
     if (needsLatch)
     {
+        ps2_input_latency::onLatchBegin(currentTick);
         rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
@@ -414,7 +423,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        Image blank = GenImageColor(tex.width, tex.height, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outWidth = FB_WIDTH;
@@ -450,13 +459,27 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
+    // Above 1x internal resolution the frame is larger than 640x512: the texture grows to hold it (never shrinks;
+    // the present draws only the frame's own rectangle). A new texture starts with the point filter.
+    if (width > static_cast<uint32_t>(tex.width) || height > static_cast<uint32_t>(tex.height))
+    {
+        const int texWidth = std::max<int>(tex.width, static_cast<int>(width));
+        const int texHeight = std::max<int>(tex.height, static_cast<int>(height));
+        UnloadTexture(tex);
+        Image blank = GenImageColor(texWidth, texHeight, BLANK);
+        tex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+        s_uploadBuffer.assign(static_cast<size_t>(texWidth) * texHeight * 4u, 0u);
+    }
+    const uint32_t texWidth = static_cast<uint32_t>(tex.width);
+    const uint32_t texHeight = static_cast<uint32_t>(tex.height);
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
+        const uint32_t copyWidth = std::min<uint32_t>(width, texWidth);
+        const uint32_t copyHeight = std::min<uint32_t>(height, texHeight);
         const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+        const size_t dstRowBytes = static_cast<size_t>(texWidth) * 4u;
         const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
         for (uint32_t y = 0; y < copyHeight; ++y)
         {
@@ -475,6 +498,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
+    if (needsLatch)
+        ps2_input_latency::onLatchPixels(s_scratch.data(), width, height);
 }
 
 PS2Runtime::PS2Runtime()
@@ -483,6 +508,13 @@ PS2Runtime::PS2Runtime()
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
 
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
+
+    // VU1 without register write queues (as in the God of War native port, about a third faster, and needed by the
+    // micro-memory capture); GOW_VU1_COLAS=1 goes back to the queued model.
+    {
+        const char *queues = std::getenv("GOW_VU1_COLAS");
+        m_vu1.setDirectRegisterWrites(!(queues && std::strcmp(queues, "1") == 0));
+    }
 
     // Assign rather than memset: R5900Context's constructor zeroes itself and
     // then applies the COP0 reset values, which a memset here would discard.
@@ -736,6 +768,9 @@ bool PS2Runtime::initialize(const char *title)
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
+        // raylib quits on Escape by default; games use Escape as a pad button (Circle here), so only the window's
+        // close button ends the run.
+        SetExitKey(KEY_NULL);
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
         {
@@ -2385,7 +2420,195 @@ void PS2Runtime::run()
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
+    const bool legacyPresent = ps2_input_latency::legacy();
+    // Swap returns inside EndDrawing, before raylib's frame limiter. Stamp t4
+    // against that return: the legacy limiter sleep happens after the stamp.
+    if (!legacyPresent || ps2_input_latency::enabled())
+        SetTargetFPS(0);
+    ps2_input_latency::attachWindow(GetWindowHandle());
+
+    bool smoothFrameTex = false; // raylib's default filter is point
+    unsigned int filteredTexId = frameTex.id;
+
+    // Settings FXAA / sharpening: one fragment shader while the frame is drawn to the window (the HUD and the
+    // ImGui windows are drawn after it, untouched). Loaded on first use, on this thread (the window's GL context).
+    static const char *const kPostFs = R"(#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+uniform vec2 texel;   // 1 / texture size
+uniform vec2 uvMax;   // the frame's last texel centre (the texture can be larger than the frame)
+uniform int fxaaOn;
+uniform float sharpen; // 0..1
+out vec4 finalColor;
+vec3 tap(vec2 uv) { return texture(texture0, min(uv, uvMax)).rgb; }
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+// FXAA (Lottes' console variant): blend along the local edge direction, keep the result inside the 3x3 luma range
+vec3 fxaa(vec2 uv)
+{
+    vec3 nw = tap(uv + vec2(-1.0, -1.0) * texel), ne = tap(uv + vec2(1.0, -1.0) * texel);
+    vec3 sw = tap(uv + vec2(-1.0, 1.0) * texel), se = tap(uv + vec2(1.0, 1.0) * texel), m = tap(uv);
+    float lNW = luma(nw), lNE = luma(ne), lSW = luma(sw), lSE = luma(se), lM = luma(m);
+    float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+    float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+    vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));
+    float reduce = max((lNW + lNE + lSW + lSE) * (0.25 / 8.0), 1.0 / 128.0);
+    dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + reduce), vec2(-8.0), vec2(8.0)) * texel;
+    vec3 a = 0.5 * (tap(uv + dir * (1.0 / 3.0 - 0.5)) + tap(uv + dir * (2.0 / 3.0 - 0.5)));
+    vec3 b = a * 0.5 + 0.25 * (tap(uv - dir * 0.5) + tap(uv + dir * 0.5));
+    float lB = luma(b);
+    return (lB < lMin || lB > lMax) ? a : b;
+}
+void main()
+{
+    vec2 uv = fragTexCoord;
+    vec3 c = fxaaOn != 0 ? fxaa(uv) : tap(uv);
+    if (sharpen > 0.0)
+    {
+        // unsharp mask limited to the cross's range: no halos
+        vec3 n = tap(uv - vec2(0.0, texel.y)), s = tap(uv + vec2(0.0, texel.y));
+        vec3 e = tap(uv + vec2(texel.x, 0.0)), w = tap(uv - vec2(texel.x, 0.0));
+        vec3 lo = min(c, min(min(n, s), min(e, w))), hi = max(c, max(max(n, s), max(e, w)));
+        c = clamp(c + (c - (n + s + e + w) * 0.25) * (2.0 * sharpen), lo, hi);
+    }
+    finalColor = vec4(c, 1.0) * colDiffuse * fragColor;
+}
+)";
+    Shader postShader{};
+    bool postShaderTried = false;
+    int locPostTexel = -1, locPostUvMax = -1, locPostFxaa = -1, locPostSharpen = -1;
+    auto beginPostShader = [&](const ps2_graphics::Settings &graphics, float frameWidth, float frameHeight)
+    {
+        if (!graphics.fxaa && graphics.sharpen <= 0)
+            return false;
+        if (!postShaderTried)
+        {
+            postShaderTried = true;
+            postShader = LoadShaderFromMemory(nullptr, kPostFs);
+            locPostTexel = GetShaderLocation(postShader, "texel");
+            locPostUvMax = GetShaderLocation(postShader, "uvMax");
+            locPostFxaa = GetShaderLocation(postShader, "fxaaOn");
+            locPostSharpen = GetShaderLocation(postShader, "sharpen");
+        }
+        if (!IsShaderValid(postShader))
+            return false;
+        const float texel[2] = {1.0f / static_cast<float>(frameTex.width), 1.0f / static_cast<float>(frameTex.height)};
+        const float uvMax[2] = {(frameWidth - 0.5f) * texel[0], (frameHeight - 0.5f) * texel[1]};
+        const int fxaaOn = graphics.fxaa ? 1 : 0;
+        const float sharpen = static_cast<float>(graphics.sharpen) / 100.0f;
+        SetShaderValue(postShader, locPostTexel, texel, SHADER_UNIFORM_VEC2);
+        SetShaderValue(postShader, locPostUvMax, uvMax, SHADER_UNIFORM_VEC2);
+        SetShaderValue(postShader, locPostFxaa, &fxaaOn, SHADER_UNIFORM_INT);
+        SetShaderValue(postShader, locPostSharpen, &sharpen, SHADER_UNIFORM_FLOAT);
+        BeginShaderMode(postShader);
+        return true;
+    };
+
+    // PS2X_HOST_SHOTS=<s>,<s>,...: the window's final picture (aspect, HUD, settings window) at those seconds as
+    // host_<s>s.png in the working directory. Read back before the swap, so it works with the monitor off; the
+    // frame shots (TEKKEN4_FRAME_SHOTS) only hold the guest frame.
+    std::vector<double> hostShotTimes;
+    if (const char *shots = std::getenv("PS2X_HOST_SHOTS"))
+    {
+        std::stringstream list(shots);
+        for (std::string item; std::getline(list, item, ',');)
+            if (!item.empty())
+                hostShotTimes.push_back(std::atof(item.c_str()));
+        std::sort(hostShotTimes.begin(), hostShotTimes.end());
+    }
+    size_t nextHostShot = 0;
+    const auto hostShotStart = std::chrono::steady_clock::now();
+    // PS2X_SCALE_AT=<s>:<scale>,...: changes the internal resolution at those seconds as the F2 window would (tests).
+    std::vector<std::pair<double, int>> scaleSteps;
+    if (const char *steps = std::getenv("PS2X_SCALE_AT"))
+    {
+        std::stringstream list(steps);
+        for (std::string item; std::getline(list, item, ',');)
+            if (const size_t colon = item.find(':'); colon != std::string::npos)
+                scaleSteps.emplace_back(std::atof(item.substr(0, colon).c_str()), std::atoi(item.c_str() + colon + 1));
+        std::sort(scaleSteps.begin(), scaleSteps.end());
+    }
+    size_t nextScaleStep = 0;
+    auto takeHostShot = [&hostShotTimes, &nextHostShot, hostShotStart, &scaleSteps, &nextScaleStep]()
+    {
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - hostShotStart).count();
+        if (nextScaleStep < scaleSteps.size() && elapsed >= scaleSteps[nextScaleStep].first)
+        {
+            ps2_graphics::Settings settings = ps2_graphics::get();
+            settings.internalScale = std::clamp(scaleSteps[nextScaleStep].second, 1, ps2_graphics::kMaxInternalScale);
+            ps2_graphics::set(settings);
+            ++nextScaleStep;
+        }
+        if (nextHostShot >= hostShotTimes.size() ||
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - hostShotStart).count() <
+                hostShotTimes[nextHostShot])
+            return;
+        rlDrawRenderBatchActive();
+        const int width = GetRenderWidth();
+        const int height = GetRenderHeight();
+        unsigned char *pixels = rlReadScreenPixels(width, height);
+        Image image{pixels, width, height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        ExportImage(image, TextFormat("host_%02ds.png", static_cast<int>(hostShotTimes[nextHostShot])));
+        MemFree(pixels);
+        ++nextHostShot;
+    };
+
+    auto presentHostFrame = [this, &frameTex, &smoothFrameTex, &filteredTexId, &takeHostShot, &beginPostShader]()
+    {
+        uint32_t presentWidth = FB_WIDTH;
+        uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        const ps2_graphics::Settings graphics = ps2_graphics::get();
+        if (graphics.smoothScreen != smoothFrameTex || frameTex.id != filteredTexId)
+        {
+            smoothFrameTex = graphics.smoothScreen;
+            filteredTexId = frameTex.id; // UploadFrame replaces the texture when the frame grows
+            SetTextureFilter(frameTex, smoothFrameTex ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+        }
+        // Keys posted during the readback are dispatched before the swap, so the
+        // game thread can see them for the rest of this guest frame.
+        if (!ps2_input_latency::legacy())
+            PollInputEvents();
+
+        BeginDrawing();
+        ClearBackground(BLACK);
+        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+        const float screenWidth = static_cast<float>(GetScreenWidth());
+        const float screenHeight = static_cast<float>(GetScreenHeight());
+        // Largest rectangle of the chosen display aspect that fits the window, centred.
+        const float aspect = ps2_graphics::displayAspect(graphics, srcWidth, srcHeight, screenWidth, screenHeight);
+        const float dstWidth = std::min(screenWidth, screenHeight * aspect);
+        const float dstHeight = std::min(screenHeight, screenWidth / aspect);
+        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+        const Rectangle dstRect{
+            (screenWidth - dstWidth) * 0.5f,
+            (screenHeight - dstHeight) * 0.5f,
+            dstWidth,
+            dstHeight};
+        const bool post = beginPostShader(graphics, srcWidth, srcHeight);
+        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        if (post)
+            EndShaderMode();
+        // Legacy present never installs the Win32 hook, so F3 is read here.
+        // The hook path toggles inside the window procedure (one edge).
+        if (!ps2_input_latency::hookInstalled() && IsKeyPressed(KEY_F3))
+            ps2_hud::toggle();
+        ps2_hud::draw();
+        if (m_debugUiInitialized && m_debugUiDrawCallback)
+        {
+            m_debugUiDrawCallback(*this, m_debugUiUserData);
+        }
+        takeHostShot();
+        EndDrawing();
+        ps2_input_latency::onSwapReturned();
+    };
+
     uint64_t tick = 0;
+    uint64_t shownTick = std::numeric_limits<uint64_t>::max();
+    auto nextPaced = std::chrono::steady_clock::now();
+    auto nextIdle = nextPaced + std::chrono::milliseconds(100);
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({
@@ -2420,31 +2643,47 @@ void PS2Runtime::run()
 
             }
         });
-        uint32_t presentWidth = FB_WIDTH;
-        uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
-
-        BeginDrawing();
-        ClearBackground(BLACK);
-        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
-        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        const float screenWidth = static_cast<float>(GetScreenWidth());
-        const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
-        const Rectangle dstRect{
-            (screenWidth - dstWidth) * 0.5f,
-            (screenHeight - dstHeight) * 0.5f,
-            dstWidth,
-            dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        if (m_debugUiInitialized && m_debugUiDrawCallback)
+        if (!legacyPresent)
         {
-            m_debugUiDrawCallback(*this, m_debugUiUserData);
+            const uint64_t guestTick = m_eeScheduler->currentVSyncTick();
+            const auto now = std::chrono::steady_clock::now();
+            const bool tickDue = ps2_input_latency::presentOnTick() && guestTick != shownTick;
+            const bool clockDue = !ps2_input_latency::presentOnTick() && now >= nextPaced;
+            const bool idleDue = now >= nextIdle;
+            if (!tickDue && !clockDue && !idleDue)
+            {
+                ps2_input_latency::waitMessage(1);
+                PollInputEvents();
+                if (WindowShouldClose())
+                {
+                    RUNTIME_LOG("[run] window close requested, breaking out of loop");
+                    requestStop();
+                    break;
+                }
+                continue;
+            }
+            presentHostFrame();
+            // The tick we just showed, including one that landed during readback,
+            // so a slow present does not tight-loop.
+            shownTick = m_eeScheduler->currentVSyncTick();
+            // Fixed 60 Hz cadence: scheduling from "now" would add the ~1 ms wake granularity every frame and drift
+            // below 60 Hz; re-anchor only after falling a whole frame behind.
+            nextPaced += std::chrono::microseconds(16667);
+            if (nextPaced < now)
+                nextPaced = now + std::chrono::microseconds(16667);
+            nextIdle = now + std::chrono::milliseconds(100);
         }
-        EndDrawing();
+        else
+        {
+            const auto frameStart = std::chrono::steady_clock::now();
+            presentHostFrame();
+            if (ps2_input_latency::enabled())
+            {
+                const auto deadline = frameStart + std::chrono::microseconds(16667);
+                if (std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::sleep_until(deadline);
+            }
+        }
 
         if (WindowShouldClose())
         {
@@ -2453,6 +2692,7 @@ void PS2Runtime::run()
             break;
         }
     }
+    ps2_input_latency::detachWindow();
 
     requestStop();
     if (gameThread.joinable())
@@ -2466,6 +2706,8 @@ void PS2Runtime::run()
         m_debugUiInitialized = false;
     }
     UnloadTexture(frameTex);
+    if (IsShaderValid(postShader))
+        UnloadShader(postShader);
     CloseWindow();
 
     RUNTIME_LOG("[run] exiting loop");

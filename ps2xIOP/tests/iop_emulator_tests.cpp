@@ -1,5 +1,12 @@
 #include "ps2x/iop/iop_subsystem.h"
 
+#include "../src/emulator/core/iop_kernel.h"
+#include "../src/emulator/core/iop_memory.h"
+#include "../src/emulator/iop_emulator.h"
+#include "../src/emulator/iop_emulator_const.h"
+
+#include <map>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -889,10 +896,1161 @@ namespace
             std::cerr << "FAIL: " << message << '\n';
         return value;
     }
+
+    // Scheduling decisions locked to the pre-queue scan: lowest priority number, then lowest id.
+    // Delay promotion is every due thread before the pick. nextWakeCycle is min(fallback, delay wakes)
+    // and does not promote. Yield does not rotate. Semaphore / clear-event ties follow map id order.
+    bool testIopScheduleOrderAndWakeCycles()
+    {
+        using namespace ps2x::iop::detail;
+
+        struct Fix
+        {
+            IopMemory memory;
+            IopKernel kernel;
+            uint32_t desc = 0x2000u;
+
+            Fix()
+                : kernel(memory)
+            {
+                kernel.reset();
+            }
+
+            int create(uint32_t priority, uint32_t entry = 0x10000u)
+            {
+                IopCpuState cpu{};
+                memory.write32(desc + 0u, 0u);
+                memory.write32(desc + 4u, 0u);
+                memory.write32(desc + 8u, entry);
+                memory.write32(desc + 12u, 0x100u);
+                memory.write32(desc + 16u, priority);
+                cpu.gpr[4] = desc;
+                desc += 0x20u;
+                if (!kernel.dispatchThreadImport(4u, cpu, 0u))
+                    return -1;
+                return static_cast<int>(cpu.gpr[2]);
+            }
+
+            bool start(int id)
+            {
+                IopCpuState cpu{};
+                cpu.gpr[4] = static_cast<uint32_t>(id);
+                return kernel.dispatchThreadImport(6u, cpu, 0u) && cpu.gpr[2] == 0u;
+            }
+
+            bool threadOp(uint16_t ordinal, int id)
+            {
+                IopCpuState cpu{};
+                cpu.gpr[4] = static_cast<uint32_t>(id);
+                return kernel.dispatchThreadImport(ordinal, cpu, 0u);
+            }
+
+            bool setPri(int id, uint32_t priority)
+            {
+                IopCpuState cpu{};
+                cpu.gpr[4] = static_cast<uint32_t>(id);
+                cpu.gpr[5] = priority;
+                return kernel.dispatchThreadImport(14u, cpu, 0u);
+            }
+
+            int semaphore(int current, int maximum)
+            {
+                IopCpuState cpu{};
+                memory.write32(desc + 0u, 0u);
+                memory.write32(desc + 4u, 0u);
+                memory.write32(desc + 8u, static_cast<uint32_t>(current));
+                memory.write32(desc + 12u, static_cast<uint32_t>(maximum));
+                cpu.gpr[4] = desc;
+                desc += 0x20u;
+                if (!kernel.dispatchSemaphoreImport(4u, cpu))
+                    return -1;
+                return static_cast<int>(cpu.gpr[2]);
+            }
+
+            bool signal(int id)
+            {
+                IopCpuState cpu{};
+                cpu.gpr[4] = static_cast<uint32_t>(id);
+                return kernel.dispatchSemaphoreImport(6u, cpu);
+            }
+
+            bool waitSem(IopThread &thread, int id)
+            {
+                thread.cpu.gpr[4] = static_cast<uint32_t>(id);
+                return kernel.dispatchSemaphoreImport(8u, thread.cpu);
+            }
+
+            int eventFlag()
+            {
+                IopCpuState cpu{};
+                memory.write32(desc + 0u, 0u);
+                memory.write32(desc + 4u, 0u);
+                memory.write32(desc + 8u, 0u);
+                cpu.gpr[4] = desc;
+                desc += 0x20u;
+                if (!kernel.dispatchEventImport(4u, cpu))
+                    return -1;
+                return static_cast<int>(cpu.gpr[2]);
+            }
+
+            bool waitEvent(IopThread &thread, int id, uint32_t bits, uint32_t mode)
+            {
+                thread.cpu.gpr[4] = static_cast<uint32_t>(id);
+                thread.cpu.gpr[5] = bits;
+                thread.cpu.gpr[6] = mode;
+                thread.cpu.gpr[7] = 0u;
+                return kernel.dispatchEventImport(10u, thread.cpu);
+            }
+
+            bool setEvent(int id, uint32_t bits)
+            {
+                IopCpuState cpu{};
+                cpu.gpr[4] = static_cast<uint32_t>(id);
+                cpu.gpr[5] = bits;
+                return kernel.dispatchEventImport(6u, cpu);
+            }
+
+            void end(IopThread &thread) { kernel.endTimeslice(thread, kThreadReturnSentinel); }
+
+            bool beginIs(uint64_t cycle, int expectId, const char *what, IopThread *&out)
+            {
+                out = kernel.beginNextReady(cycle);
+                const int got = out != nullptr ? out->id : 0;
+                if (got == expectId)
+                    return true;
+                std::cerr << "FAIL: schedule " << what << " begin got " << got << " expected " << expectId << '\n';
+                return false;
+            }
+
+            bool wakeIs(uint64_t fallback, uint64_t expectWake, const char *what)
+            {
+                const uint64_t first = kernel.nextWakeCycle(fallback);
+                const uint64_t second = kernel.nextWakeCycle(fallback);
+                if (first == second && first == expectWake)
+                    return true;
+                std::cerr << "FAIL: schedule " << what << " wake " << first << " again " << second
+                          << " expected " << expectWake << '\n';
+                return false;
+            }
+
+            bool statusIs(int id, uint32_t expectStatus, const char *what)
+            {
+                IopCpuState cpu{};
+                cpu.gpr[4] = static_cast<uint32_t>(id);
+                cpu.gpr[5] = 0x9000u;
+                if (!kernel.dispatchThreadImport(22u, cpu, 0u))
+                    return false;
+                const uint32_t status = memory.read32(0x9008u);
+                if (status == expectStatus)
+                    return true;
+                std::cerr << "FAIL: schedule " << what << " status " << status << " expected " << expectStatus << '\n';
+                return false;
+            }
+        };
+
+        IopThread *thread = nullptr;
+        {
+            Fix fx;
+            if (fx.create(30u) != 1 || fx.create(10u) != 2 || fx.create(10u) != 3 || fx.create(20u) != 4 || fx.create(1u) != 5)
+                return expect(false, "schedule create ids");
+            for (const int id : {1, 2, 3, 4, 5})
+                if (!fx.start(id))
+                    return expect(false, "schedule start");
+            if (!fx.wakeIs(1000000000ull, 1000000000ull, "pri-none") ||
+                !fx.beginIs(0u, 5, "pri-best", thread))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 5, "pri-norotate", thread))
+                return false;
+            if (!fx.kernel.dispatchThreadImport(16u, thread->cpu, 0u))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 5, "pri-after-yield", thread) || !fx.setPri(5, 40u))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 2, "pri-changed", thread) || !fx.setPri(3, 1u))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 3, "pri-ready-requeue", thread))
+                return false;
+            fx.end(*thread);
+        }
+        {
+            Fix fx;
+            if (fx.create(20u) != 1 || fx.create(5u) != 2 || fx.create(30u) != 3 || fx.create(50u) != 4)
+                return expect(false, "alarm ids");
+            for (const int id : {1, 2, 3, 4})
+                if (!fx.start(id))
+                    return false;
+            if (!fx.beginIs(0u, 2, "al-run", thread))
+                return false;
+            fx.kernel.delayCurrentUntil(1000u, thread->cpu);
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 1, "al-next", thread))
+                return false;
+            fx.kernel.delayCurrentUntil(10u, thread->cpu);
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 3, "al-third", thread))
+                return false;
+            fx.kernel.delayCurrentUntil(10u, thread->cpu);
+            fx.end(*thread);
+            if (!fx.wakeIs(5u, 5u, "al-fallback-wins") || !fx.wakeIs(50u, 10u, "al-min") ||
+                !fx.beginIs(9u, 4, "al-before", thread))
+                return false;
+            fx.end(*thread);
+            if (!fx.wakeIs(100u, 10u, "al-due-still-queued") || !fx.beginIs(10u, 1, "al-promote-best", thread) ||
+                !fx.wakeIs(1000000000ull, 1000u, "al-next-alarm"))
+                return false;
+            if (!fx.kernel.dispatchThreadImport(24u, thread->cpu, 0u))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(15u, 3, "al-sibling-promoted", thread))
+                return false;
+            if (!fx.kernel.dispatchThreadImport(24u, thread->cpu, 0u))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(16u, 4, "al-only-low", thread))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(1000u, 2, "al-late", thread))
+                return false;
+            fx.end(*thread);
+        }
+        {
+            Fix fx;
+            if (fx.create(10u) != 1 || fx.create(10u) != 2 || fx.create(40u) != 3)
+                return false;
+            for (const int id : {1, 2, 3})
+                if (!fx.start(id))
+                    return false;
+            if (!fx.beginIs(0u, 1, "tie-a", thread))
+                return false;
+            fx.kernel.delayCurrentUntil(500u, thread->cpu);
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 2, "tie-b", thread))
+                return false;
+            fx.kernel.delayCurrentUntil(500u, thread->cpu);
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 3, "tie-c", thread))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(499u, 3, "tie-early", thread))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(500u, 1, "tie-same-cycle-low-id", thread))
+                return false;
+            if (!fx.threadOp(29u, 1))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(500u, 2, "tie-after-suspend", thread))
+                return false;
+            fx.end(*thread);
+        }
+        {
+            Fix fx;
+            if (fx.create(1u) != 1 || fx.create(2u) != 2)
+                return false;
+            if (!fx.start(1) || !fx.start(2) || !fx.beginIs(0u, 1, "sl-a", thread))
+                return false;
+            if (!fx.kernel.dispatchThreadImport(24u, thread->cpu, 0u))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 2, "sl-b", thread))
+                return false;
+            fx.end(*thread);
+            if (!fx.threadOp(25u, 1) || !fx.beginIs(0u, 1, "sl-wake", thread))
+                return false;
+            if (!fx.threadOp(25u, 1) || !fx.kernel.dispatchThreadImport(24u, thread->cpu, 0u))
+                return false;
+            if (!fx.statusIs(1, 0x01u, "sl-swallow"))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 1, "sl-swallow-stays", thread))
+                return false;
+            fx.end(*thread);
+        }
+        {
+            Fix fx;
+            if (fx.create(4u) != 1 || fx.create(4u) != 2 || fx.create(8u) != 3)
+                return false;
+            for (const int id : {1, 2, 3})
+                if (!fx.start(id))
+                    return false;
+            const int sid = fx.semaphore(0, 1);
+            if (sid <= 0 || !fx.threadOp(29u, 1) || !fx.beginIs(0u, 2, "sem-b-first", thread))
+                return false;
+            if (!fx.waitSem(*thread, sid))
+                return false;
+            fx.end(*thread);
+            if (!fx.threadOp(31u, 1) || !fx.beginIs(0u, 1, "sem-a-second", thread))
+                return false;
+            if (!fx.waitSem(*thread, sid))
+                return false;
+            fx.end(*thread);
+            if (!fx.signal(sid) || !fx.beginIs(0u, 1, "sem-wake-low-id", thread))
+                return false;
+            fx.end(*thread);
+            if (!fx.signal(sid) || !fx.beginIs(0u, 1, "sem-still-lower-id", thread))
+                return false;
+            if (!fx.threadOp(29u, 1))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 2, "sem-fifo-would-differ", thread))
+                return false;
+            fx.end(*thread);
+        }
+        {
+            Fix fx;
+            if (fx.create(10u) != 1 || fx.create(10u) != 2 || !fx.start(1) || !fx.start(2))
+                return false;
+            if (!fx.beginIs(0u, 1, "pd", thread))
+                return false;
+            fx.kernel.delayCurrentUntil(100u, thread->cpu);
+            fx.end(*thread);
+            if (!fx.setPri(1, 1u) || !fx.beginIs(99u, 2, "pd-before", thread))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(100u, 1, "pd-promoted-pri", thread))
+                return false;
+            fx.end(*thread);
+        }
+        {
+            Fix fx;
+            if (fx.create(1u) != 1 || fx.create(2u) != 2 || fx.create(3u) != 3)
+                return false;
+            for (const int id : {1, 2, 3})
+                if (!fx.start(id))
+                    return false;
+            if (!fx.beginIs(0u, 1, "rd", thread))
+                return false;
+            fx.kernel.delayCurrentUntil(80u, thread->cpu);
+            fx.end(*thread);
+            if (!fx.threadOp(18u, 1) || !fx.wakeIs(5000u, 5000u, "rd-released") ||
+                !fx.beginIs(0u, 1, "rd-back", thread))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 1, "rd-hold", thread) || !fx.threadOp(5u, 2))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 1, "rd-deleted", thread) || !fx.threadOp(29u, 1))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 3, "rd-survivor", thread))
+                return false;
+            fx.end(*thread);
+        }
+        {
+            Fix fx;
+            const int victim = fx.create(1u, 0x31000u);
+            const int other = fx.create(5u, 0x32000u);
+            if (victim != 1 || other != 2 || !fx.start(1) || !fx.start(2) || !fx.beginIs(0u, 1, "term", thread))
+                return false;
+            fx.kernel.terminateThreadsInRange(0x31000u, 0x100u);
+            fx.end(*thread);
+            if (fx.kernel.threadCount() != 1u || !fx.beginIs(0u, 2, "term-other", thread))
+                return false;
+            fx.end(*thread);
+        }
+        {
+            Fix fx;
+            if (fx.create(10u) != 1 || fx.create(10u) != 2 || !fx.start(1) || !fx.start(2))
+                return false;
+            const int eid = fx.eventFlag();
+            if (eid <= 0 || !fx.threadOp(29u, 1) || !fx.beginIs(0u, 2, "ev-b-first", thread))
+                return false;
+            if (!fx.waitEvent(*thread, eid, 1u, 0x10u))
+                return false;
+            fx.end(*thread);
+            if (!fx.threadOp(31u, 1) || !fx.beginIs(0u, 1, "ev-a-second", thread))
+                return false;
+            if (!fx.waitEvent(*thread, eid, 1u, 0x10u))
+                return false;
+            fx.end(*thread);
+            if (!fx.setEvent(eid, 1u) || !fx.beginIs(0u, 1, "ev-clear-low-id", thread))
+                return false;
+            if (!fx.threadOp(29u, 1))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 0, "ev-other-stays", thread))
+                return false;
+        }
+        {
+            Fix fx;
+            if (fx.create(1u) != 1 || fx.create(2u) != 2 || !fx.start(1) || !fx.start(2))
+                return false;
+            if (!fx.beginIs(0u, 1, "usec", thread))
+                return false;
+            thread->cpu.gpr[4] = 1000u;
+            if (!fx.kernel.dispatchThreadImport(33u, thread->cpu, 0u))
+                return false;
+            fx.end(*thread);
+            const uint64_t delayCycles = (1000ull * kIopClockHz + 999999ull) / 1000000ull;
+            const uint64_t wake = std::max<uint64_t>(delayCycles, 1u);
+            if (!fx.wakeIs(1000000000ull, wake, "usec-alarm") || !fx.beginIs(wake - 1u, 2, "usec-before", thread))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(wake, 1, "usec-due", thread))
+                return false;
+            fx.end(*thread);
+        }
+        {
+            Fix fx;
+            if (fx.create(5u) != 1 || fx.create(5u) != 2 || fx.create(15u) != 3)
+                return false;
+            for (const int id : {1, 2, 3})
+                if (!fx.start(id))
+                    return false;
+            if (!fx.beginIs(0u, 1, "mix", thread))
+                return false;
+            fx.kernel.delayCurrentUntil(100u, thread->cpu);
+            fx.end(*thread);
+            const int sid = fx.semaphore(0, 1);
+            if (sid <= 0 || !fx.beginIs(0u, 2, "mix-b", thread) || !fx.waitSem(*thread, sid))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, 3, "mix-c", thread) || !fx.kernel.dispatchThreadImport(24u, thread->cpu, 0u))
+                return false;
+            fx.end(*thread);
+            if (!fx.wakeIs(1000u, 100u, "mix-alarm") || !fx.beginIs(100u, 1, "mix-due", thread) || !fx.signal(sid))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(100u, 1, "mix-low-id", thread) || !fx.threadOp(29u, 1))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(100u, 2, "mix-signalled", thread))
+                return false;
+            fx.end(*thread);
+        }
+        {
+            Fix fx;
+            int best = 0;
+            uint32_t bestPri = 999u;
+            int second = 0;
+            uint32_t secondPri = 999u;
+            for (int i = 0; i < 48; ++i)
+            {
+                const uint32_t pri = static_cast<uint32_t>((i * 17) % 126 + 1);
+                const int id = fx.create(pri, 0x20000u + static_cast<uint32_t>(i) * 4u);
+                if (id <= 0 || !fx.start(id))
+                    return expect(false, "schedule 48 create");
+                if (best == 0 || pri < bestPri || (pri == bestPri && id < best))
+                {
+                    if (best != 0 && (second == 0 || bestPri < secondPri || (bestPri == secondPri && best < second)))
+                    {
+                        second = best;
+                        secondPri = bestPri;
+                    }
+                    best = id;
+                    bestPri = pri;
+                }
+                else if (second == 0 || pri < secondPri || (pri == secondPri && id < second))
+                {
+                    second = id;
+                    secondPri = pri;
+                }
+            }
+            if (!fx.beginIs(0u, best, "many", thread))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(0u, best, "many-again", thread))
+                return false;
+            fx.kernel.delayCurrentUntil(1000u, thread->cpu);
+            fx.end(*thread);
+            if (!fx.beginIs(0u, second, "many-second", thread))
+                return false;
+            fx.end(*thread);
+            if (!fx.beginIs(1000u, best, "many-alarm", thread))
+                return false;
+            fx.end(*thread);
+            const auto started = std::chrono::steady_clock::now();
+            for (int i = 0; i < 50000; ++i)
+            {
+                IopThread *next = fx.kernel.beginNextReady(0u);
+                if (next == nullptr || next->id != best)
+                    return expect(false, "schedule bench picked a different thread");
+                fx.kernel.endTimeslice(*next, kThreadReturnSentinel);
+            }
+            const auto readyUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - started)
+                                     .count();
+            std::cout << "iop sched bench ready-pick " << readyUs << " us ("
+                      << (readyUs * 1000 / 50000) << " ns/call) 48 threads x 50000\n";
+        }
+        {
+            Fix fx;
+            for (int i = 0; i < 32; ++i)
+            {
+                const int id = fx.create(static_cast<uint32_t>((i * 3) % 60 + 1));
+                if (id <= 0 || !fx.start(id))
+                    return false;
+            }
+            int armed = 0;
+            for (;;)
+            {
+                IopThread *next = fx.kernel.beginNextReady(0u);
+                if (next == nullptr)
+                    break;
+                fx.kernel.delayCurrentUntil(500000ull + static_cast<uint64_t>(next->id), next->cpu);
+                fx.end(*next);
+                if (++armed > 32)
+                    return expect(false, "schedule wake bench did not drain ready threads");
+            }
+            if (armed != 32 || !fx.wakeIs(~uint64_t{0}, 500001ull, "wake-min"))
+                return false;
+            const auto started = std::chrono::steady_clock::now();
+            for (int i = 0; i < 50000; ++i)
+                if (fx.kernel.nextWakeCycle(~uint64_t{0}) != 500001ull)
+                    return expect(false, "schedule cached wake changed");
+            const auto wakeUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - started)
+                                    .count();
+            std::cout << "iop sched bench next-wake " << wakeUs << " us ("
+                      << (wakeUs * 1000 / 50000) << " ns/call) 32 delays x 50000\n";
+        }
+        return true;
+    }
+
+    // Two-pass MIPS so a missed branch cannot silently land in a delay slot.
+    class MipsProg
+    {
+    public:
+        explicit MipsProg(uint32_t base) : m_base(base) {}
+
+        void label(const char *name) { m_labels[name] = m_base + static_cast<uint32_t>(m_words.size() * 4u); }
+        void dw(uint32_t word) { m_words.push_back(word); }
+        void nop() { dw(0u); }
+        void jalAbs(uint32_t target) { dw(0x0C000000u | ((target >> 2u) & 0x03FFFFFFu)); }
+        void jLabel(const char *name) { m_fix.push_back(Fix{m_words.size(), name, false, 0, 0, false}); dw(0u); }
+        void bLabel(bool bne, int rs, int rt, const char *name)
+        {
+            m_fix.push_back(Fix{m_words.size(), name, true, rs, rt, bne});
+            dw(0u);
+        }
+
+        [[nodiscard]] bool finish(std::string &error)
+        {
+            for (const Fix &fix : m_fix)
+            {
+                const auto it = m_labels.find(fix.label);
+                if (it == m_labels.end())
+                {
+                    error = std::string("missing label ") + fix.label;
+                    return false;
+                }
+                if (!fix.branch)
+                {
+                    m_words[fix.index] = 0x08000000u | (it->second >> 2u);
+                    continue;
+                }
+                const uint32_t pc = m_base + static_cast<uint32_t>(fix.index * 4u);
+                const int32_t offset = static_cast<int32_t>(it->second - (pc + 4u)) >> 2;
+                if (offset < -32768 || offset > 32767)
+                {
+                    error = std::string("branch out of range ") + fix.label;
+                    return false;
+                }
+                const uint32_t op = fix.bne ? 5u : 4u;
+                m_words[fix.index] = (op << 26u) | (static_cast<uint32_t>(fix.rs) << 21u) |
+                                     (static_cast<uint32_t>(fix.rt) << 16u) |
+                                     (static_cast<uint32_t>(offset) & 0xFFFFu);
+            }
+            return true;
+        }
+
+        [[nodiscard]] const std::vector<uint32_t> &words() const { return m_words; }
+        [[nodiscard]] uint32_t end() const { return m_base + static_cast<uint32_t>(m_words.size() * 4u); }
+
+    private:
+        struct Fix
+        {
+            size_t index;
+            const char *label;
+            bool branch;
+            int rs;
+            int rt;
+            bool bne;
+        };
+        uint32_t m_base;
+        std::vector<uint32_t> m_words;
+        std::vector<Fix> m_fix;
+        std::map<std::string, uint32_t> m_labels;
+    };
+
+    void putWords(std::vector<uint8_t> &segment, uint32_t offset, const std::vector<uint32_t> &words)
+    {
+        for (size_t i = 0; i < words.size(); ++i)
+            std::memcpy(segment.data() + offset + i * 4u, &words[i], sizeof(uint32_t));
+    }
+
+    void putImport(std::vector<uint8_t> &segment, uint32_t offset, uint32_t name0, uint32_t name1,
+                   const uint16_t *ordinals, size_t count)
+    {
+        std::vector<uint32_t> words;
+        words.push_back(0x41E00000u);
+        words.push_back(0u);
+        words.push_back(0x00000101u);
+        words.push_back(name0);
+        words.push_back(name1);
+        for (size_t i = 0; i < count; ++i)
+        {
+            words.push_back(0x03E00008u);
+            words.push_back(0x24000000u | ordinals[i]);
+        }
+        words.push_back(0u);
+        words.push_back(0u);
+        putWords(segment, offset, words);
+    }
+
+    // Sleeper modes: 0 stamp, 1 Sleep, 2 WaitSema, 3 WaitEventFlag, 4 Suspend self, 5 Delay 1000 us.
+    // RPC a0: 1 Wake, 2 Signal, 3 SetEvent, 4 Start, 5 Resume, 6 ChangePri, 7 arm timer, 8 SPU DMA, 9 ReleaseWait.
+    bool writeIdleSkipIrx(TestHost &host, uint32_t address, uint32_t mode, bool startThread, std::string &error)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t sleeperAddress = 0x00010200u;
+        constexpr uint32_t irqAddress = 0x00010380u;
+        constexpr uint32_t timerAddress = 0x000103C0u;
+        constexpr uint32_t rpcAddress = 0x00010420u;
+        constexpr uint32_t thbase = 0x00010900u;
+        constexpr uint32_t createStub = thbase + 20u;
+        constexpr uint32_t startStub = createStub + 8u;
+        constexpr uint32_t sleepStub = startStub + 8u;
+        constexpr uint32_t wakeStub = sleepStub + 8u;
+        constexpr uint32_t delayStub = wakeStub + 8u;
+        constexpr uint32_t getTimeStub = delayStub + 8u;
+        constexpr uint32_t getIdStub = getTimeStub + 8u;
+        constexpr uint32_t suspendStub = getIdStub + 8u;
+        constexpr uint32_t resumeStub = suspendStub + 8u;
+        constexpr uint32_t releaseStub = resumeStub + 8u;
+        constexpr uint32_t changePriStub = releaseStub + 8u;
+        constexpr uint32_t thsemap = 0x00010980u;
+        constexpr uint32_t semCreateStub = thsemap + 20u;
+        constexpr uint32_t semSignalStub = semCreateStub + 8u;
+        constexpr uint32_t semWaitStub = semSignalStub + 8u;
+        constexpr uint32_t thevent = 0x00010A00u;
+        constexpr uint32_t evCreateStub = thevent + 20u;
+        constexpr uint32_t evSetStub = evCreateStub + 8u;
+        constexpr uint32_t evWaitStub = evSetStub + 8u;
+        constexpr uint32_t intrman = 0x00010A80u;
+        constexpr uint32_t regIntrStub = intrman + 20u;
+        constexpr uint32_t enaIntrStub = regIntrStub + 8u;
+        constexpr uint32_t timrman = 0x00010B00u;
+        constexpr uint32_t allocStub = timrman + 20u;
+        constexpr uint32_t setupStub = allocStub + 8u;
+        constexpr uint32_t setHandlerStub = setupStub + 8u;
+        constexpr uint32_t startTimerStub = setHandlerStub + 8u;
+        constexpr uint32_t sifcmd = 0x00010B80u;
+        constexpr uint32_t regRpcStub = sifcmd + 20u;
+
+        MipsProg entry(loadAddress);
+        entry.dw(0x27BDFFE0u);
+        entry.dw(0xAFBF001Cu);
+        entry.dw(0xAFB00018u);
+        entry.dw(0xAFB10014u);
+        entry.dw(0xAFB20010u);
+        entry.dw(0x3C040001u);
+        entry.dw(0x34841120u);
+        entry.jalAbs(semCreateStub);
+        entry.nop();
+        entry.dw(0x00408821u);
+        entry.dw(0x3C040001u);
+        entry.dw(0x34841140u);
+        entry.jalAbs(evCreateStub);
+        entry.nop();
+        entry.dw(0x00409021u);
+        entry.dw(0x3C040001u);
+        entry.dw(0x34841100u);
+        entry.jalAbs(createStub);
+        entry.nop();
+        entry.dw(0x00408021u);
+        entry.dw(0x3C080001u);
+        entry.dw(0xAD101160u);
+        entry.dw(0xAD111164u);
+        entry.dw(0xAD121168u);
+        entry.dw(0x24040024u);
+        entry.dw(0x00002821u);
+        entry.dw(0x3C060001u);
+        entry.dw(0x34C60380u);
+        entry.dw(0x00003821u);
+        entry.jalAbs(regIntrStub);
+        entry.nop();
+        entry.dw(0x24040024u);
+        entry.jalAbs(enaIntrStub);
+        entry.nop();
+        entry.dw(0x3C040001u);
+        entry.dw(0x348411A0u);
+        entry.dw(0x3C051111u);
+        entry.dw(0x34A50001u);
+        entry.dw(0x3C060001u);
+        entry.dw(0x34C60420u);
+        entry.dw(0x3C070001u);
+        entry.dw(0x34E711E0u);
+        entry.dw(0xAFA00010u);
+        entry.dw(0xAFA00014u);
+        entry.dw(0xAFA00018u);
+        entry.jalAbs(regRpcStub);
+        entry.nop();
+        if (startThread)
+        {
+            entry.dw(0x02002021u);
+            entry.jalAbs(startStub);
+            entry.nop();
+        }
+        entry.dw(0x8FBF001Cu);
+        entry.dw(0x8FB00018u);
+        entry.dw(0x8FB10014u);
+        entry.dw(0x8FB20010u);
+        entry.dw(0x27BD0020u);
+        entry.dw(0x03E00008u);
+        entry.dw(0x00001021u);
+
+        // Saves ra so it returns to the thread sentinel (goes dormant) instead of looping on its own jal ra.
+        MipsProg sleeper(sleeperAddress);
+        sleeper.dw(0x27BDFFF0u);
+        sleeper.dw(0xAFBF000Cu);
+        sleeper.dw(0x3C080001u);
+        sleeper.dw(0x8D0B116Cu);
+        sleeper.nop(); // R3000 load delay: the branch would still see the old t3
+        sleeper.bLabel(true, 11, 0, "not0");
+        sleeper.nop();
+        sleeper.jLabel("stamp");
+        sleeper.nop();
+        sleeper.label("not0");
+        sleeper.dw(0x240C0001u);
+        sleeper.bLabel(true, 11, 12, "not1");
+        sleeper.nop();
+        sleeper.jalAbs(sleepStub);
+        sleeper.nop();
+        sleeper.jLabel("stamp");
+        sleeper.nop();
+        sleeper.label("not1");
+        sleeper.dw(0x240C0002u);
+        sleeper.bLabel(true, 11, 12, "not2");
+        sleeper.nop();
+        sleeper.dw(0x8D041164u);
+        sleeper.jalAbs(semWaitStub);
+        sleeper.nop();
+        sleeper.jLabel("stamp");
+        sleeper.nop();
+        sleeper.label("not2");
+        sleeper.dw(0x240C0003u);
+        sleeper.bLabel(true, 11, 12, "not3");
+        sleeper.nop();
+        sleeper.dw(0x8D041168u);
+        sleeper.dw(0x24050001u);
+        sleeper.dw(0x00003021u);
+        sleeper.dw(0x00003821u);
+        sleeper.jalAbs(evWaitStub);
+        sleeper.nop();
+        sleeper.jLabel("stamp");
+        sleeper.nop();
+        sleeper.label("not3");
+        sleeper.dw(0x240C0004u);
+        sleeper.bLabel(true, 11, 12, "not4");
+        sleeper.nop();
+        sleeper.jalAbs(getIdStub);
+        sleeper.nop();
+        sleeper.dw(0x00402021u);
+        sleeper.jalAbs(suspendStub);
+        sleeper.nop();
+        sleeper.jLabel("stamp");
+        sleeper.nop();
+        sleeper.label("not4");
+        sleeper.dw(0x240403E8u);
+        sleeper.jalAbs(delayStub);
+        sleeper.nop();
+        sleeper.label("stamp");
+        sleeper.dw(0x3C040001u);
+        sleeper.dw(0x34841180u);
+        sleeper.jalAbs(getTimeStub);
+        sleeper.nop();
+        sleeper.dw(0x3C080001u);
+        sleeper.dw(0x24090001u);
+        sleeper.dw(0xAD091188u);
+        sleeper.dw(0x8FBF000Cu);
+        sleeper.nop();
+        sleeper.dw(0x27BD0010u);
+        sleeper.dw(0x03E00008u);
+        sleeper.nop();
+
+        MipsProg irq(irqAddress);
+        irq.dw(0x3C040001u);
+        irq.dw(0x8C841160u);
+        irq.jalAbs(wakeStub);
+        irq.nop();
+        irq.dw(0x03E00008u);
+        irq.nop();
+
+        MipsProg timerCb(timerAddress);
+        timerCb.dw(0x3C040001u);
+        timerCb.dw(0x8C841160u);
+        timerCb.jalAbs(wakeStub);
+        timerCb.nop();
+        timerCb.dw(0x03E00008u);
+        timerCb.dw(0x00001021u);
+
+        MipsProg rpc(rpcAddress);
+        const auto dispatch = [&](uint32_t command, const char *cmd, const char *skip)
+        {
+            rpc.dw(0x240C0000u | command);
+            rpc.bLabel(true, 4, 12, skip);
+            rpc.nop();
+            rpc.jLabel(cmd);
+            rpc.nop();
+            rpc.label(skip);
+        };
+        rpc.dw(0x27BDFFE0u);
+        rpc.dw(0xAFBF001Cu);
+        rpc.dw(0xAFB00018u);
+        rpc.dw(0x3C080001u);
+        dispatch(1u, "cmd1", "sk1");
+        dispatch(2u, "cmd2", "sk2");
+        dispatch(3u, "cmd3", "sk3");
+        dispatch(4u, "cmd4", "sk4");
+        dispatch(5u, "cmd5", "sk5");
+        dispatch(6u, "cmd6", "sk6");
+        dispatch(7u, "cmd7", "sk7");
+        dispatch(8u, "cmd8", "sk8");
+        dispatch(9u, "cmd9", "sk9");
+        rpc.jLabel("done");
+        rpc.nop();
+        rpc.label("cmd1");
+        rpc.dw(0x8D041160u);
+        rpc.jalAbs(wakeStub);
+        rpc.nop();
+        rpc.jLabel("done");
+        rpc.nop();
+        rpc.label("cmd2");
+        rpc.dw(0x8D041164u);
+        rpc.jalAbs(semSignalStub);
+        rpc.nop();
+        rpc.jLabel("done");
+        rpc.nop();
+        rpc.label("cmd3");
+        rpc.dw(0x8D041168u);
+        rpc.dw(0x24050001u);
+        rpc.jalAbs(evSetStub);
+        rpc.nop();
+        rpc.jLabel("done");
+        rpc.nop();
+        rpc.label("cmd4");
+        rpc.dw(0x8D041160u);
+        rpc.jalAbs(startStub);
+        rpc.nop();
+        rpc.jLabel("done");
+        rpc.nop();
+        rpc.label("cmd5");
+        rpc.dw(0x8D041160u);
+        rpc.jalAbs(resumeStub);
+        rpc.nop();
+        rpc.jLabel("done");
+        rpc.nop();
+        rpc.label("cmd6");
+        rpc.dw(0x8D041160u);
+        rpc.dw(0x24050001u);
+        rpc.jalAbs(changePriStub);
+        rpc.nop();
+        rpc.jLabel("done");
+        rpc.nop();
+        rpc.label("cmd7");
+        rpc.dw(0x24040001u);
+        rpc.dw(0x24050010u);
+        rpc.dw(0x24060001u);
+        rpc.jalAbs(allocStub);
+        rpc.nop();
+        rpc.dw(0x00408021u);
+        rpc.dw(0x02002021u);
+        rpc.dw(0x24050001u);
+        rpc.dw(0x24060001u);
+        rpc.dw(0x24070001u);
+        rpc.jalAbs(setupStub);
+        rpc.nop();
+        rpc.dw(0x02002021u);
+        rpc.dw(0x24050040u);
+        rpc.dw(0x3C060001u);
+        rpc.dw(0x34C603C0u);
+        rpc.dw(0x00003821u);
+        rpc.jalAbs(setHandlerStub);
+        rpc.nop();
+        rpc.dw(0x02002021u);
+        rpc.jalAbs(startTimerStub);
+        rpc.nop();
+        rpc.jLabel("done");
+        rpc.nop();
+        rpc.label("cmd8");
+        rpc.dw(0x3C081F80u);
+        rpc.dw(0x350810C8u);
+        rpc.dw(0x3C090100u);
+        rpc.dw(0xAD090000u);
+        rpc.jLabel("done");
+        rpc.nop();
+        rpc.label("cmd9");
+        rpc.dw(0x8D041160u);
+        rpc.jalAbs(releaseStub);
+        rpc.nop();
+        rpc.jLabel("done");
+        rpc.nop();
+        rpc.label("done");
+        rpc.dw(0x8FBF001Cu);
+        rpc.dw(0x8FB00018u);
+        rpc.dw(0x27BD0020u);
+        rpc.dw(0x03E00008u);
+        rpc.dw(0x00001021u);
+
+        if (!entry.finish(error) || !sleeper.finish(error) || !irq.finish(error) || !timerCb.finish(error) ||
+            !rpc.finish(error))
+            return false;
+        if (entry.end() > sleeperAddress || sleeper.end() > irqAddress || irq.end() > timerAddress ||
+            timerCb.end() > rpcAddress || rpc.end() > thbase)
+        {
+            error = "idle-skip IRX blocks overlap";
+            return false;
+        }
+
+        constexpr uint32_t filesz = 0x1300u;
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu;
+        header.ident[1] = 'E';
+        header.ident[2] = 'L';
+        header.ident[3] = 'F';
+        header.ident[4] = 1u;
+        header.ident[5] = 1u;
+        header.ident[6] = 1u;
+        header.type = 2u;
+        header.machine = 8u;
+        header.version = 1u;
+        header.entry = loadAddress;
+        header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader);
+        header.phentsize = sizeof(ProgramHeader);
+        header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u;
+        program.offset = codeOffset;
+        program.vaddr = loadAddress;
+        program.paddr = loadAddress;
+        program.filesz = filesz;
+        program.memsz = filesz;
+        program.flags = 7u;
+        program.align = 4u;
+
+        std::vector<uint8_t> segment(filesz, 0u);
+        putWords(segment, 0u, entry.words());
+        putWords(segment, sleeperAddress - loadAddress, sleeper.words());
+        putWords(segment, irqAddress - loadAddress, irq.words());
+        putWords(segment, timerAddress - loadAddress, timerCb.words());
+        putWords(segment, rpcAddress - loadAddress, rpc.words());
+        const uint16_t thbaseOrdinals[] = {4u, 6u, 24u, 25u, 33u, 34u, 20u, 29u, 31u, 18u, 14u};
+        const uint16_t semOrdinals[] = {4u, 6u, 8u};
+        const uint16_t evOrdinals[] = {4u, 6u, 10u};
+        const uint16_t intrOrdinals[] = {4u, 6u};
+        const uint16_t timerOrdinals[] = {4u, 22u, 20u, 23u};
+        const uint16_t sifOrdinals[] = {17u};
+        putImport(segment, thbase - loadAddress, 0x61626874u, 0x00006573u, thbaseOrdinals, 11u);
+        putImport(segment, thsemap - loadAddress, 0x65736874u, 0x0070616Du, semOrdinals, 3u);
+        putImport(segment, thevent - loadAddress, 0x76656874u, 0x00746E65u, evOrdinals, 3u);
+        putImport(segment, intrman - loadAddress, 0x72746E69u, 0x006E616Du, intrOrdinals, 2u);
+        putImport(segment, timrman - loadAddress, 0x726D6974u, 0x006E616Du, timerOrdinals, 4u);
+        putImport(segment, sifcmd - loadAddress, 0x63666973u, 0x0000646Du, sifOrdinals, 1u);
+        const uint32_t threadDesc[] = {0u, 0u, sleeperAddress, 0x400u, 16u};
+        const uint32_t semaDesc[] = {0u, 0u, 0u, 1u};
+        const uint32_t eventDesc[] = {0u, 0u, 0u};
+        putWords(segment, 0x1100u, std::vector<uint32_t>(threadDesc, threadDesc + 5));
+        putWords(segment, 0x1120u, std::vector<uint32_t>(semaDesc, semaDesc + 4));
+        putWords(segment, 0x1140u, std::vector<uint32_t>(eventDesc, eventDesc + 3));
+        std::memcpy(segment.data() + 0x116Cu, &mode, sizeof(mode));
+
+        if (address > host.guest.size() || codeOffset + filesz > host.guest.size() - address)
+        {
+            error = "guest buffer too small for idle-skip IRX";
+            return false;
+        }
+        std::memset(host.guest.data() + address, 0, codeOffset + filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+        return true;
+    }
+
+    struct IdleRun
+    {
+        uint64_t cycles = 0;
+        uint64_t clock = 0;
+        uint64_t skips = 0;
+        uint32_t flag = 0;
+    };
+
+    void dumpIdleLogs(const TestHost &host)
+    {
+        for (const std::string &line : host.logs)
+            std::cerr << "  " << line << '\n';
+    }
+
+    bool runIdleSkipCase(bool cache, uint32_t mode, bool startThread, uint32_t command, uint64_t eeAfter, bool probe,
+                         bool priority, IdleRun &out, std::string &why, TestHost &host)
+    {
+        using namespace ps2x::iop::detail;
+        std::string error;
+        if (!writeIdleSkipIrx(host, 0x100u, mode, startThread, error))
+        {
+            why = error;
+            return false;
+        }
+        IopEmulator iop(host);
+        iop.setIdleSkipCache(cache);
+        const ModuleLoadResult loaded = iop.loadModuleBuffer(0x100u, nullptr, 0u);
+        if (!loaded.handled || loaded.startResult != 0)
+        {
+            why = "idle-skip IRX start " + std::to_string(loaded.startResult);
+            dumpIdleLogs(host);
+            return false;
+        }
+        if (probe)
+        {
+            // The first call runs the sleeper into its wait and seals the cache on its last idle step;
+            // only a later call can skip, so the probe makes two.
+            iop.runEeCycles(8ull * 500ull);
+            iop.runEeCycles(8ull * 500ull);
+            uint32_t earlyFlag = 0xFFFFFFFFu;
+            if (!iop.readMemory(0x11188u, &earlyFlag, sizeof(earlyFlag)))
+            {
+                why = "probe flag read failed";
+                return false;
+            }
+            if (earlyFlag != 0u)
+            {
+                why = "probe ran the sleeper before the wake";
+                return false;
+            }
+            if (cache)
+            {
+                if (iop.testIdleSkipCount() < 1u)
+                {
+                    why = "probe did not skip kernel entry (cache never sealed)";
+                    return false;
+                }
+            }
+            else if (iop.testIdleSkipCount() != 0u)
+            {
+                why = "cache off counted an idle skip";
+                return false;
+            }
+        }
+        const auto rpc = [&](uint32_t function) -> bool
+        {
+            RpcRequest request;
+            request.sid = 0x11110001u;
+            request.function = function;
+            const RpcResult result = iop.handleRpc(request);
+            if (!result.handled)
+            {
+                why = "rpc " + std::to_string(function) + " was not handled";
+                dumpIdleLogs(host);
+                return false;
+            }
+            return true;
+        };
+        if (priority)
+        {
+            if (!rpc(4u))
+                return false;
+            iop.testSealIdleSkip(iop.cycles() + 1000000ull);
+            if (!rpc(6u))
+                return false;
+            iop.runEeCycles(8ull * 2000ull);
+        }
+        else if (command != 0u)
+        {
+            if (!rpc(command))
+                return false;
+            iop.runEeCycles(eeAfter);
+        }
+        uint32_t flag = 0;
+        uint32_t clockLo = 0;
+        uint32_t clockHi = 0;
+        if (!iop.readMemory(0x11188u, &flag, sizeof(flag)) ||
+            !iop.readMemory(0x11180u, &clockLo, sizeof(clockLo)) ||
+            !iop.readMemory(0x11184u, &clockHi, sizeof(clockHi)))
+        {
+            why = "stamp read failed";
+            return false;
+        }
+        out.cycles = iop.cycles();
+        out.clock = (static_cast<uint64_t>(clockHi) << 32u) | clockLo;
+        out.skips = iop.testIdleSkipCount();
+        out.flag = flag;
+        return true;
+    }
+
+    // Each source must wake at the same cycle with the idle-skip cache on and off.
+    // The probe fails if the cache never seals, so a missing invalidation cannot pass by accident.
+    bool testIopIdleSkipInvalidation()
+    {
+        struct Case
+        {
+            const char *name;
+            uint32_t mode;
+            bool start;
+            uint32_t command;
+            uint64_t eeAfter;
+            bool probe;
+            bool priority;
+        };
+        const Case cases[] = {
+            {"wake", 1u, true, 1u, 8ull * 2000ull, true, false},
+            {"release", 1u, true, 9u, 8ull * 2000ull, true, false},
+            {"signal", 2u, true, 2u, 8ull * 2000ull, true, false},
+            {"event", 3u, true, 3u, 8ull * 2000ull, true, false},
+            {"irq", 1u, true, 8u, 8ull * 2000ull, true, false},
+            {"timer", 1u, true, 7u, 8ull * 2000ull, true, false},
+            {"start", 0u, false, 4u, 8ull * 2000ull, true, false},
+            {"resume", 4u, true, 5u, 8ull * 2000ull, true, false},
+            {"priority", 0u, false, 0u, 0ull, true, true},
+            {"delay", 5u, true, 0u, 0ull, false, false},
+        };
+        for (const Case &item : cases)
+        {
+            TestHost offHost(0x4000u);
+            TestHost onHost(0x4000u);
+            IdleRun off;
+            IdleRun on;
+            std::string why;
+            if (!runIdleSkipCase(false, item.mode, item.start, item.command, item.eeAfter, item.probe, item.priority,
+                                 off, why, offHost))
+            {
+                std::cerr << "FAIL: idle-skip " << item.name << " cache off: " << why << '\n';
+                return false;
+            }
+            if (!runIdleSkipCase(true, item.mode, item.start, item.command, item.eeAfter, item.probe, item.priority, on,
+                                 why, onHost))
+            {
+                std::cerr << "FAIL: idle-skip " << item.name << " cache on: " << why << '\n';
+                return false;
+            }
+            if (off.flag != 1u || on.flag != 1u || off.clock == 0u || off.clock != on.clock || off.cycles != on.cycles)
+            {
+                std::cerr << "FAIL: idle-skip " << item.name
+                          << " off flag=" << off.flag << " clock=" << off.clock << " cycles=" << off.cycles
+                          << " skips=" << off.skips
+                          << " on flag=" << on.flag << " clock=" << on.clock << " cycles=" << on.cycles
+                          << " skips=" << on.skips << '\n';
+                dumpIdleLogs(onHost);
+                return false;
+            }
+        }
+        std::cout << "iop idle-skip 10 sources matched cache on/off\n";
+        return true;
+    }
 }
 
 int main()
 {
+    if (!testIopScheduleOrderAndWakeCycles())
+        return 1;
+    if (!testIopIdleSkipInvalidation())
+        return 1;
+
     TestHost host(0x20000u);
     IopSubsystem iop(host);
 

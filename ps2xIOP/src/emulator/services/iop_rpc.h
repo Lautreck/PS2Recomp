@@ -2,6 +2,7 @@
 
 #include "ps2x/iop/iop_types.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <unordered_map>
@@ -55,6 +56,16 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
 
+        // EE -> IOP user command (cid bit 31 clear): copies the packet into an IOP scratch block and returns the
+        // handler sceSifAddCmdHandler registered for that cid. False when the cid has no handler.
+        [[nodiscard]] bool stageUserCommand(uint32_t commandId,
+                                            const void *packet,
+                                            uint32_t packetSize,
+                                            uint32_t &packetAddress,
+                                            uint32_t &handler,
+                                            uint32_t &harg,
+                                            uint32_t &gp);
+
     private:
         struct RpcServer
         {
@@ -68,10 +79,21 @@ namespace ps2x::iop::detail
             uint32_t queue = 0;
         };
 
+        struct UserCmd
+        {
+            uint32_t handler = 0;
+            uint32_t harg = 0;
+            uint32_t gp = 0;
+        };
+
         IopHost &m_host;
         IopMemory &m_memory;
         IopKernel &m_kernel;
         std::unordered_map<uint32_t, RpcServer> m_servers;
+        std::array<UserCmd, 64> m_userCmds{};
+        uint32_t m_cmdBuffer = 0;
+        uint32_t m_cmdBufferCount = 0;
+        uint32_t m_userPacket = 0;
         uint32_t m_nextDmaId = 1u;
         bool m_sifInitialized = false;
     };

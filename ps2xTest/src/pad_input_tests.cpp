@@ -2,10 +2,14 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "Stubs/Pad.h"
+#include "runtime/ps2_graphics_settings.h"
 
 #include <vector>
 #include <cstdint>
 #include <string>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
 
 
 namespace
@@ -61,6 +65,67 @@ namespace
     {
         const uint8_t *data = rdram.data() + kPadDataAddr;
         return static_cast<uint16_t>(data[2] | (data[3] << 8));
+    }
+
+    bool nearf(float a, float b)
+    {
+        return std::fabs(a - b) < 1e-4f;
+    }
+
+    bool controlsFieldsEqual(const ps2_controls::Controls &a, const ps2_controls::Controls &b, std::string &why)
+    {
+        char ka[80];
+        char va[192];
+        char kb[80];
+        char vb[192];
+        for (int i = 0;; ++i)
+        {
+            const bool aa = ps2_controls::controlsField(a, i, ka, 80, va, 192);
+            const bool bb = ps2_controls::controlsField(b, i, kb, 80, vb, 192);
+            if (!aa && !bb)
+                return true;
+            if (!aa || !bb || std::strcmp(ka, kb) != 0 || std::strcmp(va, vb) != 0)
+            {
+                why = std::string(aa ? ka : "-") + "=" + (aa ? va : "-") + " vs " + (bb ? kb : "-") + "=" + (bb ? vb : "-");
+                return false;
+            }
+        }
+    }
+
+    ps2_controls::Controls roundTrip(const ps2_controls::Controls &src, bool &ok)
+    {
+        char text[16384];
+        int used = 0;
+        text[0] = '\0';
+        ok = true;
+        char key[80];
+        char value[192];
+        for (int i = 0; ps2_controls::controlsField(src, i, key, 80, value, 192); ++i)
+        {
+            const int n = std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), "%s=%s\n", key, value);
+            if (n < 0 || used + n >= static_cast<int>(sizeof(text)))
+            {
+                ok = false;
+                break;
+            }
+            used += n;
+        }
+        ps2_controls::Controls dst = ps2_controls::defaultControls();
+        if (ok)
+            ps2_controls::applyControlsText(dst, text);
+        return dst;
+    }
+
+    std::string fieldValue(const ps2_controls::Controls &controls, const char *want)
+    {
+        char key[80];
+        char value[192];
+        for (int i = 0; ps2_controls::controlsField(controls, i, key, 80, value, 192); ++i)
+        {
+            if (std::strcmp(key, want) == 0)
+                return value;
+        }
+        return std::string();
     }
 }
 
@@ -530,4 +595,308 @@ void register_pad_input_tests()
             t.IsTrue(std::string(reqStr).find("COMPLETE") != std::string::npos, "req string should include COMPLETE");
         });
     });
+
+    MiniTest::Case("ControlsMap", [](TestCase &tc)
+                   {
+        tc.Run("presets share the position map except Nintendo labels", [](TestCase &t)
+               {
+            const ps2_controls::Layout same[] = {ps2_controls::Layout::Playstation, ps2_controls::Layout::Xbox,
+                                                 ps2_controls::Layout::Switch, ps2_controls::Layout::Keyboard};
+            for (ps2_controls::Layout layout : same)
+            {
+                for (int b = 0; b < ps2_controls::kButtonCount; ++b)
+                {
+                    t.Equals(ps2_controls::presetSource(layout, b),
+                             ps2_controls::presetSource(ps2_controls::Layout::Playstation, b), "positional preset");
+                }
+            }
+            t.Equals(ps2_controls::presetSource(ps2_controls::Layout::Playstation, ps2_controls::Cross), 7, "cross is face down");
+            t.Equals(ps2_controls::presetSource(ps2_controls::Layout::Playstation, ps2_controls::Circle), 6, "circle is face right");
+            t.Equals(ps2_controls::presetSource(ps2_controls::Layout::Playstation, ps2_controls::Square), 8, "square is face left");
+            t.Equals(ps2_controls::presetSource(ps2_controls::Layout::Playstation, ps2_controls::Triangle), 5, "triangle is face up");
+            t.Equals(ps2_controls::presetSource(ps2_controls::Layout::Playstation, ps2_controls::Select), 13, "select is middle left");
+            t.Equals(ps2_controls::presetSource(ps2_controls::Layout::SwitchLabels, ps2_controls::Cross), 6, "nintendo A is cross");
+            t.Equals(ps2_controls::presetSource(ps2_controls::Layout::SwitchLabels, ps2_controls::Circle), 7, "nintendo B is circle");
+            t.Equals(ps2_controls::presetSource(ps2_controls::Layout::SwitchLabels, ps2_controls::Square), 5, "nintendo X is square");
+            t.Equals(ps2_controls::presetSource(ps2_controls::Layout::SwitchLabels, ps2_controls::Triangle), 8, "nintendo Y is triangle");
+            for (int b = 0; b < ps2_controls::kButtonCount; ++b)
+            {
+                if (b == ps2_controls::Cross || b == ps2_controls::Circle || b == ps2_controls::Square || b == ps2_controls::Triangle)
+                    continue;
+                t.Equals(ps2_controls::presetSource(ps2_controls::Layout::SwitchLabels, b),
+                         ps2_controls::presetSource(ps2_controls::Layout::Playstation, b), "labels keep the other buttons");
+            }
+            ps2_controls::Controls keys = ps2_controls::defaultControls();
+            t.Equals(keys.keyCount[ps2_controls::Up], 1, "defaults already have a key");
+            ps2_controls::applyLayout(keys, ps2_controls::Layout::Keyboard);
+            t.IsTrue(keys.ignoreGamepads, "keyboard preset ignores gamepads");
+            t.Equals(keys.keyCount[ps2_controls::Up], 1, "layout change keeps keys");
+            t.IsFalse(ps2_controls::defaultControls().ignoreGamepads, "position default uses the gamepad");
+        });
+
+        tc.Run("default key table matches today's keyboard", [](TestCase &t)
+               {
+            const ps2_controls::Controls controls = ps2_controls::defaultControls();
+            ps2_controls::Snap snap;
+            ps2_controls::fillSnap(snap, controls);
+            t.Equals(snap.pollCount, 22, "22 default keys");
+            t.Equals(snap.rlCount, 22, "22 raylib keys");
+            t.Equals(snap.stickCount, 0, "no default stick keys");
+            t.IsTrue(nearf(snap.deadzoneLeft, 0.15f) && nearf(snap.deadzoneRight, 0.15f), "deadzone 0.15");
+            t.IsFalse(snap.invertLeft || snap.invertRight || snap.stickSwap || snap.ignoreGamepads, "no invert swap or ignore");
+            t.IsTrue(snap.triggerThreshold < 0.f, "digital triggers");
+            const struct
+            {
+                unsigned vk;
+                uint16_t mask;
+            } rows[] = {
+                {0x57, 0x0010}, {0x53, 0x0040}, {0x41, 0x0080}, {0x44, 0x0020},
+                {0x58, 0x4000}, {0x43, 0x2000}, {0x5A, 0x8000}, {0x56, 0x1000},
+                {0x51, 0x0400}, {0x45, 0x0800}, {0xA0, 0x0100}, {0x10, 0x0100}, {0xA1, 0x0200},
+                {0x0D, 0x0008}, {0x09, 0x0001}, {0x28, 0x4000}, {0x20, 0x4000},
+                {0x27, 0x2000}, {0x1B, 0x2000}, {0x25, 0x8000}, {0x60, 0x8000},
+                {0x26, 0x1000}, {0x61, 0x1000}, {0x42, 0},
+            };
+            for (const auto &row : rows)
+                t.Equals(snap.vkMask[row.vk], row.mask, "default vk mask");
+            t.Equals(fieldValue(controls, "controls_key_CROSS"), std::string("DOWN,X,SPACE"), "cross keys");
+            t.Equals(fieldValue(controls, "controls_key_CIRCLE"), std::string("RIGHT,C,ESCAPE"), "circle keys");
+            t.Equals(controls.keyCount[ps2_controls::L3], 0, "no L3 key");
+            t.Equals(controls.keyCount[ps2_controls::R3], 0, "no R3 key");
+            int l3 = 0;
+            int r3 = 0;
+            for (int v = 0; v < 256; ++v)
+            {
+                if ((snap.vkMask[v] & 0x0002u) != 0)
+                    ++l3;
+                if ((snap.vkMask[v] & 0x0004u) != 0)
+                    ++r3;
+            }
+            t.Equals(l3, 0, "L3 vk unused");
+            t.Equals(r3, 0, "R3 vk unused");
+        });
+
+        tc.Run("remapped keys or into the fast-path table", [](TestCase &t)
+               {
+            ps2_controls::Controls controls = ps2_controls::defaultControls();
+            t.IsTrue(ps2_controls::applyControlsField(controls, "controls_key_CROSS", "DOWN,C,SPACE"), "cross remap");
+            t.IsTrue(ps2_controls::applyControlsField(controls, "controls_key_CIRCLE", "RIGHT,X,ESCAPE"), "circle remap");
+            ps2_controls::Snap snap;
+            ps2_controls::fillSnap(snap, controls);
+            t.Equals(snap.vkMask[0x58], static_cast<uint16_t>(0x2000), "X is circle");
+            t.Equals(snap.vkMask[0x43], static_cast<uint16_t>(0x4000), "C is cross");
+            t.Equals(snap.vkMask[0x28], static_cast<uint16_t>(0x4000), "down arrow stays cross");
+            t.Equals(snap.vkMask[0x57], static_cast<uint16_t>(0x0010), "W stays up");
+            ps2_controls::Controls shared = ps2_controls::defaultControls();
+            t.IsTrue(ps2_controls::applyControlsField(shared, "controls_key_UP", "W,X"), "share X");
+            ps2_controls::fillSnap(snap, shared);
+            t.Equals(snap.vkMask[0x58], static_cast<uint16_t>(0x4010), "X ors up and cross");
+            t.Equals(snap.vkMask[0x57], static_cast<uint16_t>(0x0010), "W still up");
+        });
+
+        tc.Run("bad control fields are ignored", [](TestCase &t)
+               {
+            ps2_controls::Controls controls = ps2_controls::defaultControls();
+            const ps2_controls::Controls saved = controls;
+            std::string why;
+            const char *badKeys[] = {"controls_layout", "controls_deadzone", "controls_deadzone", "controls_invert_y",
+                                    "controls_gp_CROSS", "controls_key_CROSS", "controls_trigger", "controls_rumble",
+                                    "controls_gp_FOO", "controls_key_CROSS"};
+            const char *badVals[] = {"gamecube", "1.2", "-0.1", "sideways", "NOT_A_BUTTON", "NOT_A_KEY", "2", "1",
+                                    "LEFT_FACE_UP", "DOWN,NOT_A_KEY"};
+            for (int i = 0; i < 10; ++i)
+            {
+                t.IsFalse(ps2_controls::applyControlsField(controls, badKeys[i], badVals[i]), "bad field rejected");
+                t.IsTrue(controlsFieldsEqual(controls, saved, why), why.empty() ? "bad field changed state" : why);
+            }
+            t.IsFalse(ps2_controls::applyControlsField(controls, "Controls_layout", "xbox"), "prefix is case-sensitive");
+            t.IsTrue(ps2_controls::applyControlsField(controls, "controls_key_UP", ""), "empty list clears");
+            t.Equals(controls.keyCount[ps2_controls::Up], 0, "UP cleared");
+            t.Equals(controls.keyCount[ps2_controls::Down], 1, "DOWN kept");
+            t.IsTrue(ps2_controls::applyControlsField(controls, "controls_deadzone", "0,20"), "comma decimal");
+            t.Equals(fieldValue(controls, "controls_deadzone_left"), std::string("0.200"), "deadzone 0.200");
+            t.IsTrue(ps2_controls::applyControlsField(controls, "controls_trigger", "off"), "trigger off");
+            t.IsTrue(ps2_controls::applyControlsField(controls, "controls_trigger", "0"), "trigger 0 is off");
+            t.IsTrue(ps2_controls::applyControlsField(controls, "controls_trigger", "null"), "trigger null is off");
+            t.IsTrue(controls.triggerThreshold < 0.f, "threshold stays off");
+        });
+
+        tc.Run("radial deadzone invert and swap", [](TestCase &t)
+               {
+            float x = 0.1f;
+            float y = 0.f;
+            ps2_controls::applyRadialDeadzone(x, y, 0.15f);
+            t.IsTrue(x == 0.f && y == 0.f, "inside deadzone");
+            x = -0.1f;
+            y = 0.f;
+            ps2_controls::applyRadialDeadzone(x, y, 0.15f);
+            t.IsTrue(x == 0.f && y == 0.f, "negative inside deadzone");
+            x = 0.f;
+            y = 0.f;
+            ps2_controls::applyRadialDeadzone(x, y, 0.15f);
+            t.IsTrue(x == 0.f && y == 0.f, "origin");
+            x = 1.f;
+            y = 0.f;
+            ps2_controls::applyRadialDeadzone(x, y, 0.15f);
+            t.IsTrue(nearf(x, 1.f) && y == 0.f, "full deflection");
+            x = -1.f;
+            y = 0.f;
+            ps2_controls::applyRadialDeadzone(x, y, 0.15f);
+            t.IsTrue(nearf(x, -1.f) && y == 0.f, "full left");
+            x = 0.5f;
+            y = 0.f;
+            ps2_controls::applyRadialDeadzone(x, y, 0.15f);
+            t.IsTrue(nearf(x, 0.4117647f), "half rescaled");
+            x = 3.f;
+            y = 4.f;
+            ps2_controls::applyRadialDeadzone(x, y, 0.15f);
+            t.IsTrue(nearf(x, 0.6f) && nearf(y, 0.8f), "over-range unit clamp");
+            x = 0.25f;
+            y = -0.4f;
+            ps2_controls::applyRadialDeadzone(x, y, 0.f);
+            t.IsTrue(nearf(x, 0.25f) && nearf(y, -0.4f), "zero deadzone keeps the vector");
+
+            ps2_controls::Snap snap{};
+            snap.deadzoneLeft = 0.f;
+            snap.deadzoneRight = 0.f;
+            snap.invertRight = true;
+            ps2_controls::StickFloats sticks;
+            sticks.ry = 0.5f;
+            ps2_controls::invertAndDeadzone(snap, sticks);
+            t.IsTrue(nearf(sticks.ry, -0.5f) && sticks.ly == 0.f, "invert right only");
+
+            snap = ps2_controls::Snap{};
+            snap.invertLeft = true;
+            snap.deadzoneLeft = 0.15f;
+            sticks = ps2_controls::StickFloats{};
+            sticks.ly = 0.5f;
+            ps2_controls::invertAndDeadzone(snap, sticks);
+            t.IsTrue(nearf(sticks.ly, -0.4117647f), "invert then deadzone");
+
+            snap = ps2_controls::Snap{};
+            snap.deadzoneLeft = 0.f;
+            snap.deadzoneRight = 0.f;
+            snap.stickSwap = true;
+            snap.invertRight = true;
+            sticks = ps2_controls::StickFloats{};
+            sticks.lx = 0.2f;
+            sticks.ly = 0.3f;
+            sticks.rx = -0.4f;
+            sticks.ry = 0.8f;
+            ps2_controls::swapSticksIf(snap, sticks);
+            ps2_controls::invertAndDeadzone(snap, sticks);
+            t.IsTrue(nearf(sticks.lx, -0.4f) && nearf(sticks.ly, 0.8f) && nearf(sticks.rx, 0.2f) && nearf(sticks.ry, -0.3f),
+                     "swap then invert right");
+        });
+
+        tc.Run("gamepad map and trigger threshold", [](TestCase &t)
+               {
+            ps2_controls::Controls controls = ps2_controls::defaultControls();
+            ps2_controls::Snap snap;
+            ps2_controls::fillSnap(snap, controls);
+            bool down[18] = {};
+            float axes[6] = {};
+            bool signedL = false;
+            bool signedR = false;
+            ps2_controls::StickFloats sticks;
+            down[7] = true;
+            uint16_t pressed = ps2_controls::mapGamepad(snap, down, axes, signedL, signedR, sticks, true);
+            t.Equals(pressed, static_cast<uint16_t>(0x4000), "face down is cross");
+            down[7] = false;
+            axes[0] = 0.4f;
+            pressed = ps2_controls::mapGamepad(snap, down, axes, signedL, signedR, sticks, false);
+            t.Equals(pressed, static_cast<uint16_t>(0), "blocked buttons");
+            t.IsTrue(nearf(sticks.lx, 0.4f), "sticks still copy");
+
+            ps2_controls::applyLayout(controls, ps2_controls::Layout::SwitchLabels);
+            ps2_controls::fillSnap(snap, controls);
+            down[6] = true;
+            axes[0] = 0.f;
+            pressed = ps2_controls::mapGamepad(snap, down, axes, signedL, signedR, sticks, true);
+            t.Equals(pressed, static_cast<uint16_t>(0x4000), "nintendo A is cross");
+            down[6] = false;
+            down[7] = true;
+            pressed = ps2_controls::mapGamepad(snap, down, axes, signedL, signedR, sticks, true);
+            t.Equals(pressed, static_cast<uint16_t>(0x2000), "nintendo B is circle");
+
+            controls = ps2_controls::defaultControls();
+            ps2_controls::fillSnap(snap, controls);
+            bool digital[18] = {};
+            digital[10] = true;
+            float idle[6] = {};
+            signedL = false;
+            pressed = ps2_controls::mapGamepad(snap, digital, idle, signedL, signedR, sticks, true);
+            t.Equals(pressed & static_cast<uint16_t>(0x0100), static_cast<uint16_t>(0x0100), "digital L2");
+            digital[10] = false;
+            idle[4] = 1.f;
+            pressed = ps2_controls::mapGamepad(snap, digital, idle, signedL, signedR, sticks, true);
+            t.Equals(pressed & static_cast<uint16_t>(0x0100), static_cast<uint16_t>(0), "axis ignored while digital");
+
+            t.IsTrue(ps2_controls::applyControlsField(controls, "controls_gp_L2", "LEFT_TRIGGER_AXIS"), "bind axis");
+            ps2_controls::fillSnap(snap, controls);
+            idle[4] = 1.f;
+            signedL = false;
+            pressed = ps2_controls::mapGamepad(snap, digital, idle, signedL, signedR, sticks, true);
+            t.Equals(pressed & static_cast<uint16_t>(0x0100), static_cast<uint16_t>(0x0100), "axis at 1 uses 0.5");
+            idle[4] = 0.4f;
+            pressed = ps2_controls::mapGamepad(snap, digital, idle, signedL, signedR, sticks, true);
+            t.Equals(pressed & static_cast<uint16_t>(0x0100), static_cast<uint16_t>(0), "axis 0.4 below 0.5");
+
+            controls = ps2_controls::defaultControls();
+            t.IsTrue(ps2_controls::applyControlsField(controls, "controls_trigger", "0.4"), "threshold 0.4");
+            t.Equals(fieldValue(controls, "controls_trigger"), std::string("0.400"), "trigger field");
+            ps2_controls::fillSnap(snap, controls);
+            bool sawAxis = false;
+            bool sawDigital = false;
+            for (int i = 0; i < snap.gpCount; ++i)
+            {
+                if (snap.gp[i].mask != 0x0100u)
+                    continue;
+                if (snap.gp[i].src == ps2_controls::kSrcAxisLeft)
+                    sawAxis = true;
+                if (snap.gp[i].src == ps2_controls::kGpLeftTrigger2)
+                    sawDigital = true;
+            }
+            t.IsTrue(sawAxis, "L2 rewritten to the axis");
+            t.IsFalse(sawDigital, "digital L2 removed");
+            float trig[6] = {};
+            bool none[18] = {};
+            signedL = false;
+            trig[4] = 1.f;
+            pressed = ps2_controls::mapGamepad(snap, none, trig, signedL, signedR, sticks, true);
+            t.IsTrue((pressed & 0x0100u) != 0 && !signedL, "unsigned full press");
+            trig[4] = -1.f;
+            pressed = ps2_controls::mapGamepad(snap, none, trig, signedL, signedR, sticks, true);
+            t.IsTrue((pressed & 0x0100u) == 0 && signedL, "signed rest is clear");
+            trig[4] = 0.f;
+            pressed = ps2_controls::mapGamepad(snap, none, trig, signedL, signedR, sticks, true);
+            t.IsTrue((pressed & 0x0100u) != 0 && signedL, "signed centre is half");
+            trig[4] = -0.3f;
+            pressed = ps2_controls::mapGamepad(snap, none, trig, signedL, signedR, sticks, true);
+            t.IsTrue((pressed & 0x0100u) == 0, "signed 0.35 is under 0.4");
+        });
+
+        tc.Run("settings text round-trips", [](TestCase &t)
+               {
+            bool ok = false;
+            std::string why;
+            const ps2_controls::Controls defaults = ps2_controls::defaultControls();
+            const ps2_controls::Controls back = roundTrip(defaults, ok);
+            t.IsTrue(ok, "default text fits");
+            t.IsTrue(controlsFieldsEqual(defaults, back, why), why.empty() ? "default round trip" : why);
+
+            ps2_controls::Controls modified = ps2_controls::defaultControls();
+            t.IsTrue(ps2_controls::applyControlsField(modified, "controls_layout", "switch-labels"), "layout");
+            t.IsTrue(ps2_controls::applyControlsField(modified, "controls_deadzone", "0.25"), "deadzone");
+            t.IsTrue(ps2_controls::applyControlsField(modified, "controls_invert_y", "both"), "invert");
+            t.IsTrue(ps2_controls::applyControlsField(modified, "controls_stick_swap", "1"), "swap");
+            t.IsTrue(ps2_controls::applyControlsField(modified, "controls_key_CROSS", "DOWN,C,SPACE"), "cross");
+            t.IsTrue(ps2_controls::applyControlsField(modified, "controls_key_CIRCLE", "RIGHT,X,ESCAPE"), "circle");
+            const ps2_controls::Controls again = roundTrip(modified, ok);
+            t.IsTrue(ok, "modified text fits");
+            t.IsTrue(controlsFieldsEqual(modified, again, why), why.empty() ? "modified round trip" : why);
+            t.IsTrue(again.ignoreGamepads == false, "switch-labels still uses gamepads");
+            t.Equals(again.gp[ps2_controls::Cross][0], 6, "round trip keeps nintendo A");
+        });
+                   });
 }
