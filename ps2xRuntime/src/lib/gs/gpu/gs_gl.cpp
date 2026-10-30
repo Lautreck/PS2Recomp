@@ -333,8 +333,9 @@ namespace GSGL
             {
                 gl.BindTexture(kTexture2D, slot.frame.texture);
                 gl.TexImage2D(kTexture2D, 0, kRgba8, width, height, 0, kRgba, kUnsignedByte, nullptr);
-                gl.TexParameteri(kTexture2D, kTextureMinFilter, kLinear);
-                gl.TexParameteri(kTexture2D, kTextureMagFilter, kLinear);
+                // Point, matching the readback texture. The host sets bilinear when F2 smooth scaling is on.
+                gl.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
+                gl.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
                 gl.TexParameteri(kTexture2D, kTextureWrapS, kClampToEdge);
                 gl.TexParameteri(kTexture2D, kTextureWrapT, kClampToEdge);
                 gl.BindTexture(kTexture2D, 0u);

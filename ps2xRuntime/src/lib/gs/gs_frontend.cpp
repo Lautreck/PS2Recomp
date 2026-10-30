@@ -545,6 +545,12 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
+bool GS::usesSharedPresentation() const
+{
+    std::lock_guard<std::mutex> lock(m_backendLifetimeMutex);
+    return m_backend && m_backend->UsesSharedPresentation();
+}
+
 void GS::latchHostPresentationFrame()
 {
     GSPresentationRequest request{};
@@ -603,6 +609,62 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t *outSourceFbp,
                                           bool *outUsedPreferred) const
 {
+    bool haveStored = false;
+    {
+        std::lock_guard<std::mutex> lock(m_presentationMutex);
+        haveStored = m_hasHostPresentationFrame && !m_hostPresentationFrame.empty();
+    }
+    // Shared presentation stores no pixels. Captures (frame shots, the present log) read the picture back once.
+    if (!haveStored && usesSharedPresentation())
+    {
+        GSPresentationRequest request{};
+        {
+            std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+            if (!m_privRegs)
+                return false;
+            request = buildPresentationRequestUnlocked();
+        }
+        request.forceReadback = true;
+        PresentationFrame frame{};
+        {
+            std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+            if (m_backend)
+                frame = m_backend->Present(request);
+        }
+        if (!frame)
+            return false;
+        const size_t stride = static_cast<size_t>(std::max<uint32_t>(frame.width, kHostFrameWidth)) * 4u;
+        const size_t row = static_cast<size_t>(frame.width) * 4u;
+        outPixels.resize(row * static_cast<size_t>(frame.height));
+        for (uint32_t y = 0; y < frame.height; ++y)
+        {
+            const size_t srcOffset = static_cast<size_t>(y) * stride;
+            if (srcOffset + row > frame.pixels.size())
+            {
+                outPixels.clear();
+                outWidth = 0u;
+                outHeight = 0u;
+                if (outDisplayFbp)
+                    *outDisplayFbp = 0u;
+                if (outSourceFbp)
+                    *outSourceFbp = 0u;
+                if (outUsedPreferred)
+                    *outUsedPreferred = false;
+                return false;
+            }
+            std::memcpy(outPixels.data() + static_cast<size_t>(y) * row, frame.pixels.data() + srcOffset, row);
+        }
+        outWidth = frame.width;
+        outHeight = frame.height;
+        if (outDisplayFbp)
+            *outDisplayFbp = frame.displayFbp;
+        if (outSourceFbp)
+            *outSourceFbp = frame.sourceFbp;
+        if (outUsedPreferred)
+            *outUsedPreferred = frame.usedPreferred;
+        return true;
+    }
+
     std::lock_guard<std::mutex> lock(m_presentationMutex);
     if (!m_hasHostPresentationFrame || m_hostPresentationFrame.empty())
     {

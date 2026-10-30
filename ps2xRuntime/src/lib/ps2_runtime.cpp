@@ -17,8 +17,12 @@
 #include "runtime/ps2_graphics_settings.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
+#if defined(PS2X_GS_GL)
+#include "runtime/gs/gs_shared_present.h"
+#endif
 
 #include <iostream>
+#include <cstdio>
 #include <stdexcept>
 #include <fstream>
 #include <algorithm>
@@ -379,7 +383,64 @@ namespace
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+// Once a second, while TEKKEN4_HUD_LOG=1: how the window got its picture (shared texture or readback)
+// and the host frame interval. upload_* is the time spent publishing that picture.
+static void noteDisplayedFrame(const char *mode, uint64_t uploadNs)
+{
+    static auto windowStart = std::chrono::steady_clock::now();
+    static auto lastPresent = windowStart;
+    static uint32_t shared = 0u;
+    static uint32_t readback = 0u;
+    static uint32_t blank = 0u;
+    static uint32_t frames = 0u;
+    static uint64_t uploadSum = 0u;
+    static uint64_t uploadMax = 0u;
+    static uint64_t intervalSum = 0u;
+    static uint64_t intervalMax = 0u;
+    static int second = 0;
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t intervalNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - lastPresent).count());
+    lastPresent = now;
+    if (std::strcmp(mode, "shared") == 0)
+        ++shared;
+    else if (std::strcmp(mode, "blank") == 0)
+        ++blank;
+    else
+        ++readback;
+    ++frames;
+    uploadSum += uploadNs;
+    if (uploadNs > uploadMax)
+        uploadMax = uploadNs;
+    if (frames > 1u)
+    {
+        intervalSum += intervalNs;
+        if (intervalNs > intervalMax)
+            intervalMax = intervalNs;
+    }
+    if (now - windowStart < std::chrono::seconds(1))
+        return;
+    const char *log = std::getenv("TEKKEN4_HUD_LOG");
+    if (log && std::strcmp(log, "1") == 0)
+    {
+        const uint32_t gaps = frames > 1u ? frames - 1u : 1u;
+        std::fprintf(stdout,
+                     "[present] s=%d mode=%s shared=%u readback=%u blank=%u upload_avg_us=%llu upload_max_us=%llu "
+                     "interval_avg_us=%llu interval_max_us=%llu\n",
+                     ++second, mode, shared, readback, blank,
+                     static_cast<unsigned long long>(uploadSum / frames / 1000ull),
+                     static_cast<unsigned long long>(uploadMax / 1000ull),
+                     static_cast<unsigned long long>(intervalSum / gaps / 1000ull),
+                     static_cast<unsigned long long>(intervalMax / 1000ull));
+        std::fflush(stdout);
+    }
+    windowStart = now;
+    shared = readback = blank = frames = 0u;
+    uploadSum = uploadMax = intervalSum = intervalMax = 0u;
+}
+
+static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight,
+                        Texture2D *drawTex = nullptr)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -396,6 +457,100 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     // Fallback guest fps (no game override reports its frames): a new presented vsync tick.
     ps2_hud::onHostPresent(needsLatch);
+    const auto useReadbackTexture = [&]()
+    {
+        if (drawTex)
+            *drawTex = tex;
+    };
+#if defined(PS2X_GS_GL)
+    // Shared texture with the window: no glReadPixels and no CPU copies. PS2X_GS_DIRECT_PRESENT=0 never
+    // captures the host context, so Active() stays false and this falls through to the readback path.
+    // TEKKEN4_INPUT_LAG keeps the readback path so its frame hash still sees pixels.
+    static uint64_t s_sharedSequence = 0u;
+    static int s_sharedMisses = 0;
+    static bool s_sharedGaveUp = false;
+    static Texture2D s_sharedHold{};
+    const bool wantShared = drawTex && !s_sharedGaveUp && GSSharedPresent::Active() &&
+                            !ps2_input_latency::enabled() && rt->gs().usesSharedPresentation();
+    if (wantShared)
+    {
+        if (needsLatch)
+        {
+            ps2_input_latency::onLatchBegin(currentTick);
+            rt->gs().latchHostPresentationFrame();
+            s_lastPresentationTick = currentTick;
+            s_hasLatchedInitialFrame = true;
+        }
+        GSSharedPresent::Frame frame{};
+        bool have = GSSharedPresent::Acquire(frame);
+        if (needsLatch)
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(12);
+            while ((!have || frame.sequence <= s_sharedSequence) && std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::yield();
+                have = GSSharedPresent::Acquire(frame);
+            }
+            if (have)
+                s_sharedSequence = std::max(s_sharedSequence, frame.sequence);
+        }
+        const bool picture = have && !frame.blank && frame.texture != 0u && frame.width != 0u && frame.height != 0u;
+        if (picture)
+        {
+            static bool announced = false;
+            if (!announced)
+            {
+                announced = true;
+                std::fprintf(stderr, "[present] drawing shared texture %ux%u\n", frame.width, frame.height);
+                std::fflush(stderr);
+            }
+            s_sharedMisses = 0;
+            s_sharedHold.id = frame.texture;
+            s_sharedHold.width = static_cast<int>(frame.width);
+            s_sharedHold.height = static_cast<int>(frame.height);
+            s_sharedHold.mipmaps = 1;
+            s_sharedHold.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            *drawTex = s_sharedHold;
+            outWidth = frame.width;
+            outHeight = frame.height;
+            s_lastWidth = outWidth;
+            s_lastHeight = outHeight;
+            s_hasUploadedFrame = true;
+            return;
+        }
+        if (have && frame.blank)
+        {
+            s_sharedMisses = 0;
+            drawTex->id = 0u;
+            outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
+            outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+            s_hasUploadedFrame = true;
+            return;
+        }
+        if (needsLatch && ++s_sharedMisses >= 90)
+        {
+            s_sharedGaveUp = true;
+            std::fprintf(stderr, "[present] shared presentation produced no picture; falling back to readback\n");
+            std::fflush(stderr);
+        }
+        else
+        {
+            if (s_sharedHold.id != 0u)
+            {
+                *drawTex = s_sharedHold;
+                outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
+                outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+            }
+            else
+            {
+                drawTex->id = 0u;
+                outWidth = FB_WIDTH;
+                outHeight = DEFAULT_DISPLAY_HEIGHT;
+            }
+            return;
+        }
+    }
+#endif
     if (needsLatch)
     {
         ps2_input_latency::onLatchBegin(currentTick);
@@ -407,6 +562,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        useReadbackTexture();
         return;
     }
 
@@ -431,6 +587,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         s_lastWidth = outWidth;
         s_lastHeight = outHeight;
         s_hasUploadedFrame = true;
+        useReadbackTexture();
         return;
     }
 
@@ -498,6 +655,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
+    useReadbackTexture();
     if (needsLatch)
         ps2_input_latency::onLatchPixels(s_scratch.data(), width, height);
 }
@@ -755,7 +913,20 @@ bool PS2Runtime::initialize(const char *title)
             return false;
         }
 
-        if (!syncCoreSubsystems())
+#if !defined(PLATFORM_VITA)
+        // Window first, so the GL GS context (created on the worker by syncCoreSubsystems) can share objects with
+        // it. The presented picture is then a GPU texture. PS2X_GS_DIRECT_PRESENT=0 leaves the readback path.
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+#if defined(PS2X_GS_GL)
+        GSSharedPresent::CaptureHostContext(); // releases the window context until RestoreHostContext
+#endif
+#endif
+        const bool coreBound = syncCoreSubsystems();
+#if defined(PS2X_GS_GL) && !defined(PLATFORM_VITA)
+        GSSharedPresent::RestoreHostContext();
+#endif
+        if (!coreBound)
         {
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
@@ -763,8 +934,6 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
@@ -2478,7 +2647,8 @@ void main()
     Shader postShader{};
     bool postShaderTried = false;
     int locPostTexel = -1, locPostUvMax = -1, locPostFxaa = -1, locPostSharpen = -1;
-    auto beginPostShader = [&](const ps2_graphics::Settings &graphics, float frameWidth, float frameHeight)
+    auto beginPostShader = [&](const ps2_graphics::Settings &graphics, float frameWidth, float frameHeight,
+                                float texWidth, float texHeight)
     {
         if (!graphics.fxaa && graphics.sharpen <= 0)
             return false;
@@ -2493,7 +2663,7 @@ void main()
         }
         if (!IsShaderValid(postShader))
             return false;
-        const float texel[2] = {1.0f / static_cast<float>(frameTex.width), 1.0f / static_cast<float>(frameTex.height)};
+        const float texel[2] = {1.0f / texWidth, 1.0f / texHeight};
         const float uvMax[2] = {(frameWidth - 0.5f) * texel[0], (frameHeight - 0.5f) * texel[1]};
         const int fxaaOn = graphics.fxaa ? 1 : 0;
         const float sharpen = static_cast<float>(graphics.sharpen) / 100.0f;
@@ -2558,13 +2728,21 @@ void main()
     {
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        Texture2D drawTex{};
+        const auto uploadT0 = std::chrono::steady_clock::now();
+        UploadFrame(frameTex, this, presentWidth, presentHeight, &drawTex);
+        const uint64_t uploadNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - uploadT0).count());
+        // A shared texture has its own id. id 0 is a blank (PMODE off) or a picture that is not published yet.
+        const bool sharedPicture = drawTex.id != 0u && drawTex.id != frameTex.id;
+        noteDisplayedFrame(sharedPicture ? "shared" : (drawTex.id == 0u ? "blank" : "readback"), uploadNs);
         const ps2_graphics::Settings graphics = ps2_graphics::get();
-        if (graphics.smoothScreen != smoothFrameTex || frameTex.id != filteredTexId)
+        const Texture2D &shown = drawTex.id != 0u ? drawTex : frameTex;
+        if (drawTex.id != 0u && (graphics.smoothScreen != smoothFrameTex || shown.id != filteredTexId))
         {
             smoothFrameTex = graphics.smoothScreen;
-            filteredTexId = frameTex.id; // UploadFrame replaces the texture when the frame grows
-            SetTextureFilter(frameTex, smoothFrameTex ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+            filteredTexId = shown.id; // a new id (grown readback texture, or another shared slot) needs its filter
+            SetTextureFilter(shown, smoothFrameTex ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
         }
         // Keys posted during the readback are dispatched before the swap, so the
         // game thread can see them for the rest of this guest frame.
@@ -2587,8 +2765,11 @@ void main()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
-        const bool post = beginPostShader(graphics, srcWidth, srcHeight);
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        const float texW = static_cast<float>(std::max(1, shown.width));
+        const float texH = static_cast<float>(std::max(1, shown.height));
+        const bool post = drawTex.id != 0u && beginPostShader(graphics, srcWidth, srcHeight, texW, texH);
+        if (drawTex.id != 0u)
+            DrawTexturePro(shown, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         if (post)
             EndShaderMode();
         // Legacy present never installs the Win32 hook, so F3 is read here.

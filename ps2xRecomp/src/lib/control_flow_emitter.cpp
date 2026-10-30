@@ -44,7 +44,8 @@ namespace ps2recomp
 
     bool ControlFlowEmitter::hasRealDelaySlot() const
     {
-        return !m_delaySlotOverride.empty() || !isGuestNop(m_delaySlot);
+        // A switch patch on a nop delay slot still has to run the patched word.
+        return !m_delaySlotOverride.empty() || !isGuestNop(m_delaySlot) || !m_delaySlot.switchName.empty();
     }
 
     bool ControlFlowEmitter::isCallLikeEdge() const

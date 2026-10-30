@@ -998,6 +998,8 @@ namespace ps2_graphics
                     g_settings.internalScale = value;
                 else if (key == "widescreen")
                     g_settings.widescreen = value != 0;
+                else if (key == "no_interlace")
+                    g_settings.noInterlace = value != 0;
                 else if (key == "texture_filter" && (value == 0 || value == 1))
                     g_settings.textureFilter = static_cast<TextureFilter>(value);
                 else if (key == "fxaa")
@@ -1014,6 +1016,7 @@ namespace ps2_graphics
         void applySwitchesLocked()
         {
             ps2_switches::set("widescreen", g_settings.widescreen);
+            ps2_switches::set("no_interlace", g_settings.noInterlace);
         }
 
         void saveLocked()
@@ -1028,6 +1031,7 @@ namespace ps2_graphics
             std::fprintf(file, "smooth_screen=%d\n", g_settings.smoothScreen ? 1 : 0);
             std::fprintf(file, "internal_scale=%d\n", g_settings.internalScale);
             std::fprintf(file, "widescreen=%d\n", g_settings.widescreen ? 1 : 0);
+            std::fprintf(file, "no_interlace=%d\n", g_settings.noInterlace ? 1 : 0);
             std::fprintf(file, "texture_filter=%d\n", static_cast<int>(g_settings.textureFilter));
             std::fprintf(file, "fxaa=%d\n", g_settings.fxaa ? 1 : 0);
             std::fprintf(file, "sharpen=%d\n", g_settings.sharpen);
@@ -1078,4 +1082,13 @@ namespace ps2_graphics
             return frameHeight > 0.0f ? frameWidth / frameHeight : 4.0f / 3.0f;
         }
     }
+}
+
+namespace
+{
+    // no_interlace is consumed at GS reset during boot, before the first present/F2 get().
+    [[maybe_unused]] const int g_loadGraphicsSettings = [] {
+        (void)ps2_graphics::get();
+        return 0;
+    }();
 }

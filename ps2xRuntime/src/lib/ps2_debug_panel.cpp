@@ -2444,6 +2444,10 @@ namespace
                     settings.aspect = ps2_graphics::Aspect::Ratio4x3;
                 changed = true;
             }
+            if (ImGui::Checkbox("No-Interlacing (progressive, removes field bob)", &settings.noInterlace))
+                changed = true;
+            if (settings.noInterlace)
+                ImGui::TextDisabled("Applied when the game resets the GS (boot). Restart if toggled mid-run.");
             static const char *const kAspects[] = {"4:3", "16:9", "Stretch to window",
                                                    "Frame pixels (640x448, old default)"};
             int aspect = static_cast<int>(settings.aspect);

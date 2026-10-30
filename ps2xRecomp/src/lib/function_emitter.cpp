@@ -24,6 +24,24 @@ namespace ps2recomp
             inst.function = SPECIAL_SLL;
             return inst;
         }
+
+        // Unindented body: ControlFlowEmitter prefixes each line with the delay-slot indent.
+        std::string emitSwitchableDelaySlot(CodeGenerator &cg, const Instruction &original)
+        {
+            const Instruction patched = R5900Decoder().decodeInstruction(original.address, original.switchRaw);
+            if (patched.isBranch || patched.isJump || patched.hasDelaySlot)
+                throw std::runtime_error("switch patch must not be a branch or jump");
+
+            std::ostringstream body;
+            body << "if (PS2_SWITCH(\"" << original.switchName << "\")) { // 0x" << std::hex << original.switchRaw
+                 << std::dec << "  " << R5900Decoder::disassembleInstruction(patched) << " (Delay Slot)\n";
+            body << cg.translateInstruction(patched) << "\n";
+            body << "} else { // 0x" << std::hex << original.raw << std::dec << "  "
+                 << R5900Decoder::disassembleInstruction(original) << " (Delay Slot)\n";
+            body << cg.translateInstruction(original) << "\n";
+            body << "}";
+            return body.str();
+        }
     }
 
     FunctionEmitter::FunctionEmitter(CodeGenerator &codeGenerator)
@@ -152,13 +170,25 @@ namespace ps2recomp
                         ss << "label_" << std::hex << delaySlot->address << std::dec << ":\n";
                     }
 
-                    if (hasDecodedDelaySlot && !delaySlot->switchName.empty())
-                        throw std::runtime_error("switch patch in a branch delay slot is not supported");
-
-                    if (gifDmaKickPlan.valid &&
+                    const bool gifDmaDelaySlot =
+                        gifDmaKickPlan.valid &&
                         gifDmaKickPlan.completesInDelaySlot &&
                         gifDmaKickPlan.branchIndex == i &&
-                        hasDecodedDelaySlot)
+                        hasDecodedDelaySlot;
+
+                    if (hasDecodedDelaySlot && !delaySlot->switchName.empty() && gifDmaDelaySlot)
+                        throw std::runtime_error("switch patch in a GIF DMA kick delay slot is not supported");
+
+                    if (hasDecodedDelaySlot && !delaySlot->switchName.empty())
+                    {
+                        ss << cg.handleBranchDelaySlots(
+                            inst,
+                            *delaySlot,
+                            function,
+                            analysisResult,
+                            emitSwitchableDelaySlot(cg, *delaySlot));
+                    }
+                    else if (gifDmaDelaySlot)
                     {
                         ss << cg.handleBranchDelaySlots(
                             inst,

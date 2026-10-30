@@ -2006,6 +2006,214 @@ void register_code_generator_tests()
                      "jalr fallback should not dispatch directly to tail-jump delay slot");
         });
 
+        tc.Run("switch patch on a JAL delay slot emits both words", [](TestCase &t) {
+            Function func;
+            func.name = "jal_delay_switch";
+            func.start = 0x22B134;
+            func.end = 0x22B140;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            Instruction jal = makeJal(0x22B134, 0x22AF18);
+            Instruction delay = makeAddiu(0x22B138, 5, 0, 4);
+            delay.switchName = "no_interlace";
+            delay.switchRaw = 0x24050006u;
+
+            CodeGenerator gen({}, {});
+            std::string generated = gen.generateFunction(func, {jal, delay}, false);
+            printGeneratedCode("switch patch on a JAL delay slot emits both words", generated);
+
+            t.IsTrue(generated.find("if (PS2_SWITCH(\"no_interlace\"))") != std::string::npos,
+                     "delay-slot switch should emit PS2_SWITCH");
+            t.IsTrue(generated.find("SET_GPR_S32(ctx, 5, (int32_t)ADD32(GPR_U32(ctx, 0), 6));") != std::string::npos,
+                     "patched delay slot should load immediate 6");
+            t.IsTrue(generated.find("SET_GPR_S32(ctx, 5, (int32_t)ADD32(GPR_U32(ctx, 0), 4));") != std::string::npos,
+                     "original delay slot should load immediate 4");
+            t.IsTrue(generated.find("ctx->in_delay_slot = true;") != std::string::npos,
+                     "switchable delay slot still runs as the branch delay slot");
+            const auto switchAt = generated.find("if (PS2_SWITCH(\"no_interlace\"))");
+            const auto delayFlag = generated.find("ctx->in_delay_slot = true;");
+            t.IsTrue(switchAt != std::string::npos && delayFlag != std::string::npos && switchAt > delayFlag,
+                     "both delay-slot variants should be emitted inside the branch delay-slot region");
+        });
+
+        tc.Run("switch patch on a BEQ delay slot emits both words", [](TestCase &t) {
+            Function func;
+            func.name = "beq_delay_switch";
+            func.start = 0x1000;
+            func.end = 0x1010;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            Instruction br = makeBranch(0x1000, 1);
+            Instruction delay = makeAddiu(0x1004, 2, 0, 1);
+            delay.switchName = "no_interlace";
+            delay.switchRaw = 0x24020002u;
+            Instruction target = makeNop(0x1008);
+
+            CodeGenerator gen({}, {});
+            std::string generated = gen.generateFunction(func, {br, delay, target}, false);
+            printGeneratedCode("switch patch on a BEQ delay slot emits both words", generated);
+
+            t.IsTrue(generated.find("if (PS2_SWITCH(\"no_interlace\"))") != std::string::npos,
+                     "conditional-branch delay-slot switch should emit PS2_SWITCH");
+            t.IsTrue(generated.find("SET_GPR_S32(ctx, 2, (int32_t)ADD32(GPR_U32(ctx, 0), 2));") != std::string::npos,
+                     "patched BEQ delay slot should load immediate 2");
+            t.IsTrue(generated.find("SET_GPR_S32(ctx, 2, (int32_t)ADD32(GPR_U32(ctx, 0), 1));") != std::string::npos,
+                     "original BEQ delay slot should load immediate 1");
+        });
+
+        tc.Run("switch patch on a likely-branch delay slot stays on the taken path", [](TestCase &t) {
+            Function func;
+            func.name = "beql_delay_switch";
+            func.start = 0x1200;
+            func.end = 0x1210;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            Instruction br{};
+            br.address = 0x1200;
+            br.opcode = OPCODE_BEQL;
+            br.rs = 1;
+            br.rt = 2;
+            br.simmediate = 1;
+            br.isBranch = true;
+            br.hasDelaySlot = true;
+            br.raw = 0x50010001u;
+
+            Instruction delay = makeAddiu(0x1204, 7, 0, 123);
+            delay.switchName = "no_interlace";
+            delay.switchRaw = 0x24070009u;
+            Instruction target = makeNop(0x1208);
+
+            CodeGenerator gen({}, {});
+            std::string generated = gen.generateFunction(func, {br, delay, target}, false);
+            printGeneratedCode("switch patch on a likely-branch delay slot stays on the taken path", generated);
+
+            t.IsTrue(generated.find("if (branch_taken_0x1200)") != std::string::npos,
+                     "likely branch should still gate the delay slot");
+            t.IsTrue(generated.find("if (PS2_SWITCH(\"no_interlace\"))") != std::string::npos,
+                     "likely-branch delay-slot switch should emit PS2_SWITCH");
+            t.IsTrue(generated.find("SET_GPR_S32(ctx, 7, (int32_t)ADD32(GPR_U32(ctx, 0), 9));") != std::string::npos,
+                     "patched likely delay slot should load immediate 9");
+            t.IsTrue(generated.find("SET_GPR_S32(ctx, 7, (int32_t)ADD32(GPR_U32(ctx, 0), 123));") != std::string::npos,
+                     "original likely delay slot should load immediate 123");
+        });
+
+        tc.Run("switch patch on a nop delay slot still emits the patched word", [](TestCase &t) {
+            Function func;
+            func.name = "nop_delay_switch";
+            func.start = 0x2000;
+            func.end = 0x2010;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            Instruction jal = makeJal(0x2000, 0x3000);
+            Instruction delay = makeNop(0x2004);
+            delay.switchName = "no_interlace";
+            delay.switchRaw = 0x24050006u;
+
+            CodeGenerator gen({}, {});
+            std::string generated = gen.generateFunction(func, {jal, delay}, false);
+            printGeneratedCode("switch patch on a nop delay slot still emits the patched word", generated);
+
+            t.IsTrue(generated.find("if (PS2_SWITCH(\"no_interlace\"))") != std::string::npos,
+                     "nop delay-slot switch must not be dropped as a guest nop");
+            t.IsTrue(generated.find("SET_GPR_S32(ctx, 5, (int32_t)ADD32(GPR_U32(ctx, 0), 6));") != std::string::npos,
+                     "patched word of a nop delay slot should still be translated");
+        });
+
+        tc.Run("non-delay switch patch still emits both words", [](TestCase &t) {
+            Function func;
+            func.name = "body_switch";
+            func.start = 0x1E2250;
+            func.end = 0x1E225C;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            Instruction lui = makeLui(0x1E2250, 16, 0x37);
+            Instruction addiu = makeAddiu(0x1E2254, 2, 0, 1);
+            addiu.switchName = "no_interlace";
+            addiu.switchRaw = 0x24020002u;
+            Instruction next = makeNop(0x1E2258);
+
+            CodeGenerator gen({}, {});
+            std::string generated = gen.generateFunction(func, {lui, addiu, next}, false);
+            printGeneratedCode("non-delay switch patch still emits both words", generated);
+
+            t.IsTrue(generated.find("if (PS2_SWITCH(\"no_interlace\"))") != std::string::npos,
+                     "body switch should emit PS2_SWITCH");
+            t.IsTrue(generated.find("SET_GPR_S32(ctx, 2, (int32_t)ADD32(GPR_U32(ctx, 0), 2));") != std::string::npos,
+                     "patched body word should load immediate 2");
+            t.IsTrue(generated.find("SET_GPR_S32(ctx, 2, (int32_t)ADD32(GPR_U32(ctx, 0), 1));") != std::string::npos,
+                     "original body word should load immediate 1");
+        });
+
+        tc.Run("switch patch that becomes a branch is rejected", [](TestCase &t) {
+            Function func;
+            func.name = "switch_to_branch";
+            func.start = 0x4000;
+            func.end = 0x4010;
+            func.isRecompiled = true;
+            func.isStub = false;
+
+            Instruction jal = makeJal(0x4000, 0x5000);
+            Instruction delay = makeAddiu(0x4004, 2, 0, 1);
+            delay.switchName = "no_interlace";
+            delay.switchRaw = 0x10000001u;
+
+            CodeGenerator gen({}, {});
+            bool threw = false;
+            try
+            {
+                (void)gen.generateFunction(func, {jal, delay}, false);
+            }
+            catch (const std::exception &)
+            {
+                threw = true;
+            }
+            t.IsTrue(threw, "a switch whose patched word is a branch must throw");
+        });
+
+        tc.Run("switch patch on a GIF DMA kick delay slot is rejected", [](TestCase &t) {
+            Function func;
+            func.name = "gif_delay_switch";
+            func.start = 0x2E7C90;
+            func.end = 0x2E7CC8;
+            func.isRecompiled = true;
+
+            std::vector<Instruction> instructions;
+            instructions.push_back(makeBranch(0x2E7C90, 2));
+            instructions.push_back(makeLui(0x2E7C94, 5, 0x1000));
+            instructions.push_back(makeLui(0x2E7C98, 5, 0x1000));
+            instructions.push_back(makeAddiu(0x2E7C9C, 6, 0, 4));
+            instructions.push_back(makeOri(0x2E7CA0, 3, 5, 0xE020));
+            instructions.push_back(makeSw(0x2E7CA4, 6, 3, 0));
+            instructions.push_back(makeOri(0x2E7CA8, 3, 5, 0xE010));
+            instructions.push_back(makeSw(0x2E7CAC, 6, 3, 0));
+            instructions.push_back(makeOri(0x2E7CB0, 3, 5, 0xA030));
+            instructions.push_back(makeSw(0x2E7CB4, 4, 3, 0));
+            instructions.push_back(makeAddiu(0x2E7CB8, 4, 0, 0x0105));
+            instructions.push_back(makeOri(0x2E7CBC, 3, 5, 0xA000));
+            instructions.push_back(makeJr(0x2E7CC0, 31));
+            Instruction chcr = makeSw(0x2E7CC4, 4, 3, 0);
+            chcr.switchName = "no_interlace";
+            chcr.switchRaw = 0xAC640000u;
+            instructions.push_back(chcr);
+
+            CodeGenerator gen({}, {});
+            bool threw = false;
+            try
+            {
+                (void)gen.generateFunction(func, instructions, false);
+            }
+            catch (const std::exception &)
+            {
+                threw = true;
+            }
+            t.IsTrue(threw, "a switch on a coalesced GIF DMA kick delay slot must throw");
+        });
+
         tc.Run("VU random helpers emit line comments on separate lines", [](TestCase &t) {
             CodeGenerator gen({}, {});
 

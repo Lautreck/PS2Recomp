@@ -1,0 +1,14 @@
+Review copy for Claude. Baseline commit is upstream plus patches 01-42.
+The uncommitted diff is this session's code: patch 43 (no-interlace) and patch 44 (shared present).
+Look at it with: git diff HEAD
+
+Not in this tree, already on tekken4-recomp master:
+- docs/SUPER_RECOMPILER.md
+- config/ghidra_export.toml (three no_interlace words)
+- docs/status.md (the review note)
+- logs/grok/us-netcheck-report.md (no source change)
+- logs/grok/no-interlace-report.md and logs/grok/zero-copy-report.md
+
+ps2x_tests re-run 2026-10-30: no-interlace tree 496/496, zero-copy tree 489/489.
+Fight captures from this morning were not re-measured.
+This file is a pointer. It is not part of either patch.

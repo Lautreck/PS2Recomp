@@ -193,6 +193,7 @@ namespace ps2_graphics
         bool smoothScreen = false; // bilinear filtering when the frame is scaled to the window
         int internalScale = 1;     // GL GS renderer resolution, 1..4 x the PS2's (PS2X_GS_HW_SCALE wins until changed)
         bool widescreen = false;   // runtime switch "widescreen": the game's 16:9 patch ([patches] in the recompiler config)
+        bool noInterlace = false;  // runtime switch "no_interlace": PCSX2 No-Interlacing (boot GS mode 480p; removes field bob)
         TextureFilter textureFilter = TextureFilter::Game;
         bool fxaa = false;         // FXAA on the frame as it is drawn to the window
         int sharpen = 0;           // 0..100 %, contrast-limited sharpening in the same pass
